@@ -1,0 +1,1 @@
+# squid-proxy-monitor-dashboard
