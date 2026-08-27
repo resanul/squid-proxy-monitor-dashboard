@@ -128,8 +128,8 @@ access to `access.log` (including after log rotation), and the one-line
 reverting its own edit if not. It never restarts Squid outside of the controlled
 reload path.
 
-Full walkthrough, including the reasoning behind each step and a Bengali version:
-[`docs/setup-guide-bn.md`](docs/setup-guide-bn.md).
+Full walkthrough, including the reasoning behind each step:
+[`docs/setup-guide.md`](docs/setup-guide.md).
 
 ## What's in this repo
 
