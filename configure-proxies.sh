@@ -72,20 +72,20 @@ if [ -f "$OUT" ]; then
 fi
 echo
 
-read -r -p "কয়টা Squid proxy monitor করবেন? How many proxies? : " N
+read -r -p "How many proxies do you want to monitor? : " N
 case "$N" in ''|*[!0-9]*) echo "a number is required"; exit 1;; esac
 if [ "$N" -lt 1 ]; then echo "nothing to configure"; exit 0; fi
 
 echo
-ask_yn SAME_USER "সব proxy তে SSH user কি একই? Same SSH user on every proxy?" y
+ask_yn SAME_USER "Same SSH user on every proxy?" y
 if [ "$SAME_USER" = "1" ]; then
   ask COMMON_USER "  SSH username" "$(whoami)"
 fi
-ask_yn SAME_PATH "সব proxy তে access.log path কি একই? Same log path on every proxy?" y
+ask_yn SAME_PATH "Same log path on every proxy?" y
 if [ "$SAME_PATH" = "1" ]; then
   ask COMMON_PATH "  access.log path" "/var/log/squid/access.log"
 fi
-ask_yn SAME_KEY "টেস্ট SSH key: একটাই ব্যবহার করবেন? Use one SSH key to test connectivity?" y
+ask_yn SAME_KEY "Use one SSH key to test connectivity?" y
 if [ "$SAME_KEY" = "1" ]; then
   ask TEST_KEY "  key path (blank = your default identity)" "$SSH_KEY_DEFAULT"
 fi
