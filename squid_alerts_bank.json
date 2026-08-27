@@ -1,0 +1,196 @@
+{
+  "_comment": "Bank / financial-institution alert ruleset for squid_dashboard.py. Copy to squid_alerts.json (or pass --alerts-config squid_alerts_bank.json). Volume-based thresholds assume ~500-2000 proxy users at 30-80 req/s peak \u2014 CALIBRATE against your own dashboard baseline before trusting them. See README for the calibration formulas. Volume thresholds in THIS copy are calibrated to an observed baseline of ~5 req/s, 211 clients, 84% CONNECT. Rescale proportionally if your traffic differs. Blacklist rules use match:host - matching full URLs makes CDN path hashes and search queries fire false positives.",
+  "rules": [
+    {
+      "id": "exfil-storage",
+      "name": "Data exfiltration risk: file-sharing / paste site",
+      "type": "blacklist",
+      "enabled": true,
+      "severity": "critical",
+      "cooldown": 60,
+      "pattern": "\\b(?:dropbox|mega\\.(?:nz|io)|mediafire|4shared|zippyshare|sendspace|wetransfer|filemail|terabox|pcloud|anonfiles|gofile\\.io|file\\.io|krakenfiles|bayfiles|uploadfiles\\.io|dosyaupload)\\b|\\b(?:pastebin\\.com|paste\\.ee|ghostbin|hastebin|privnote|justpaste\\.it|controlc\\.com|0bin\\.net|rentry\\.co|dpaste\\.(?:com|org))\\b",
+      "match": "host"
+    },
+    {
+      "id": "tunnel-anonymizer",
+      "name": "Policy bypass: VPN / TOR / remote-access tool",
+      "type": "blacklist",
+      "enabled": true,
+      "severity": "critical",
+      "cooldown": 60,
+      "pattern": "\\.onion\\b|\\btorproject\\.org\\b|\\b(?:teamviewer|anydesk|logmein|gotomypc|rustdesk|ultraviewer|radmin|ammyy|showmypc|splashtop)\\b|\\b(?:ngrok\\.(?:io|com|app)|localtunnel|trycloudflare\\.com|serveo\\.net|pagekite|portmap\\.io|localhost\\.run)\\b|\\b(?:nordvpn|expressvpn|protonvpn|surfshark|windscribe|tunnelbear|zenmate|hotspotshield|psiphon\\d*|ultrasurf|browsec|hola\\.org|vpngate|softether)\\b",
+      "match": "host"
+    },
+    {
+      "id": "crypto-mining",
+      "name": "Crypto mining pool contacted",
+      "type": "blacklist",
+      "enabled": true,
+      "severity": "critical",
+      "cooldown": 300,
+      "pattern": "\\b(?:xmrig|minexmr|nanopool|ethermine|f2pool|poolin|antpool|2miners|hiveon|cryptonight|coinhive|coin-hive|jsecoin|webminepool|minergate|supportxmr)\\b|\\bstratum\\+tcp\\b",
+      "match": "host"
+    },
+    {
+      "id": "dyndns-c2",
+      "name": "Dynamic DNS host (common C2 infrastructure)",
+      "type": "blacklist",
+      "enabled": true,
+      "severity": "warning",
+      "cooldown": 300,
+      "pattern": "\\b(?:duckdns\\.org|no-ip\\.(?:com|org|biz)|ddns\\.net|dynu\\.com|hopto\\.org|zapto\\.org|serveftp\\.com|myftp\\.(?:biz|org)|redirectme\\.net|sytes\\.net|afraid\\.org|freedns\\.|changeip\\.com|dnsdynamic)\\b",
+      "match": "host"
+    },
+    {
+      "id": "personal-webmail",
+      "name": "Personal webmail / disposable mail accessed",
+      "type": "blacklist",
+      "enabled": false,
+      "severity": "warning",
+      "cooldown": 300,
+      "pattern": "\\b(?:mail\\.ru|protonmail\\.com|proton\\.me|tutanota\\.com|gmx\\.(?:com|net)|mail\\.com|temp-mail\\.org|10minutemail|guerrillamail|mailinator|yopmail)\\b",
+      "match": "host"
+    },
+    {
+      "id": "malware-generic",
+      "name": "Malware / phishing keyword in host",
+      "type": "blacklist",
+      "enabled": true,
+      "severity": "critical",
+      "cooldown": 60,
+      "pattern": "\\b(?:malware|botnet|phish(?:ing)?|ransom(?:ware)?|keylog(?:ger)?|trojan)\\b|\\bc2\\.[a-z0-9-]+\\.",
+      "match": "host"
+    },
+    {
+      "id": "exfil-bandwidth",
+      "name": "Large upload/transfer by one client (possible exfiltration)",
+      "type": "bandwidth_spike",
+      "enabled": true,
+      "severity": "warning",
+      "cooldown": 600,
+      "window": 300,
+      "threshold_mb": 50,
+      "_note": "busiest observed client moved 2.9 MB total; 50 MB/5min is a real outlier"
+    },
+    {
+      "id": "exfil-bandwidth-severe",
+      "name": "Massive transfer by one client",
+      "type": "bandwidth_spike",
+      "enabled": true,
+      "severity": "critical",
+      "cooldown": 900,
+      "window": 300,
+      "threshold_mb": 200
+    },
+    {
+      "id": "beacon-rate",
+      "name": "Sustained request rate from one client (beaconing / scan)",
+      "type": "client_request_rate",
+      "enabled": true,
+      "severity": "warning",
+      "cooldown": 600,
+      "window": 300,
+      "threshold": 800,
+      "_note": "~8x the busiest observed client (100 req/5min)"
+    },
+    {
+      "id": "denied-burst",
+      "name": "Policy denial burst",
+      "type": "denied_rate",
+      "enabled": true,
+      "severity": "warning",
+      "cooldown": 300,
+      "window": 60,
+      "threshold": 120
+    },
+    {
+      "id": "auth-failures",
+      "name": "Proxy auth failures (407) \u2014 credential problem or brute force",
+      "type": "status_code",
+      "enabled": true,
+      "severity": "warning",
+      "cooldown": 300,
+      "window": 60,
+      "code": 407,
+      "threshold": 60
+    },
+    {
+      "id": "forbidden-spike",
+      "name": "403 Forbidden spike",
+      "type": "status_code",
+      "enabled": false,
+      "severity": "info",
+      "cooldown": 600,
+      "window": 60,
+      "code": 403,
+      "threshold": 150
+    },
+    {
+      "id": "upstream-5xx",
+      "name": "Upstream gateway errors (502)",
+      "type": "status_code",
+      "enabled": true,
+      "severity": "warning",
+      "cooldown": 300,
+      "window": 60,
+      "code": 502,
+      "threshold": 25
+    },
+    {
+      "id": "service-unavailable",
+      "name": "Service unavailable (503) spike",
+      "type": "status_code",
+      "enabled": true,
+      "severity": "warning",
+      "cooldown": 300,
+      "window": 60,
+      "code": 503,
+      "threshold": 25
+    },
+    {
+      "id": "error-rate",
+      "name": "Overall error rate elevated",
+      "type": "error_rate",
+      "enabled": true,
+      "severity": "info",
+      "cooldown": 600,
+      "window": 60,
+      "threshold": 250
+    },
+    {
+      "id": "slow-pileup",
+      "name": "Slow request pileup (user-visible latency)",
+      "type": "slow_rate",
+      "enabled": true,
+      "severity": "warning",
+      "cooldown": 600,
+      "window": 120,
+      "threshold": 40,
+      "latency_ms": 5000
+    },
+    {
+      "id": "hit-collapse",
+      "name": "Cache hit ratio collapse",
+      "type": "hit_ratio_low",
+      "enabled": false,
+      "severity": "info",
+      "cooldown": 1800,
+      "window": 900,
+      "threshold_pct": 15,
+      "min_requests": 500,
+      "_note": "disabled: traffic is ~84% CONNECT (HTTPS tunnels are not cacheable), so a low hit ratio is normal here, not a fault"
+    },
+    {
+      "id": "gateway-timeout",
+      "name": "Gateway timeouts (504) elevated",
+      "type": "status_code",
+      "enabled": true,
+      "severity": "warning",
+      "cooldown": 300,
+      "window": 60,
+      "code": 504,
+      "threshold": 40,
+      "_note": "94 x 504 observed in ~12 min (~8/min); 40/min flags a real spike"
+    }
+  ]
+}

@@ -1,0 +1,1502 @@
+#!/usr/bin/env python3
+# ============================================================================
+#  squid-policy — per-IP access policy compiler for Squid
+# ============================================================================
+#  Runs on the PROXY server, owned by root. squid.conf is edited exactly ONCE
+#  (a single `include` line); after that every policy change is a regeneration
+#  of that included file from a JSON policy database.
+#
+#  Flow for every change:  validate -> generate -> `squid -k parse`
+#                          -> `squid -k reconfigure` -> audit
+#  Anything that fails rolls the previous config back automatically.
+#
+#  INSTALL (as root on the proxy)
+#      install -o root -g root -m 0755 squid-policy /usr/local/sbin/
+#      /usr/local/sbin/squid-policy init          # creates dirs + starter policy
+#      # add the printed `include` line to squid.conf, then:
+#      /usr/local/sbin/squid-policy apply
+#      echo 'USER ALL=(root) NOPASSWD: /usr/local/sbin/squid-policy' \
+#          > /etc/sudoers.d/squid-policy
+#      chmod 0440 /etc/sudoers.d/squid-policy
+#
+#  COMMANDS
+#      init                    create directories and a starter policy
+#      get                     print the current policy JSON
+#      set                     read a full policy JSON on stdin, then apply
+#      apply                   regenerate + validate + reload from stored policy
+#      validate                dry run: validate and show the generated config
+#      show                    human-readable summary
+#      rollback                restore the previous generated config
+#      baseline                print the industry-baseline policy JSON
+#
+#  EXIT CODES
+#      0 ok · 2 usage/validation · 3 squid rejected config (rolled back)
+#      4 reload failed (rolled back) · 5 refused (unsafe/protected)
+# ============================================================================
+
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+
+DIR = os.environ.get("SQUID_POLICY_DIR", "/etc/squid/policy")
+SQUID_BIN = os.environ.get("SQUID_BIN", "squid")
+AUDIT = os.environ.get("SQUID_POLICY_AUDIT", "/var/log/squid/policy_audit.log")
+
+SQUID_CONF = os.environ.get("SQUID_CONF", "/etc/squid/squid.conf")
+CONF_BACKUPS = os.path.join(DIR, "conf-backups")
+CONF_MAX = 512 * 1024          # a squid.conf larger than this is not a config
+
+POLICY = os.path.join(DIR, "policy.json")
+RULES = os.path.join(DIR, "rules.conf")
+RULES_PRE = os.path.join(DIR, "rules-pre.conf")
+LISTS = os.path.join(DIR, "lists")
+BACKUPS = os.path.join(DIR, "backups")
+
+# Destinations that must never end up in a deny list, whatever the request says.
+PROTECTED = [
+    "windowsupdate.com", "update.microsoft.com", "microsoftonline.com",
+    "office365.com", "officecdn.microsoft.com", "microsoft.com",
+    "cb.example.gov", "centralbank.example.gov", "swift.com",
+    "visa.com", "mastercard.com", "localhost", "localdomain",
+    # --- production payment / government rails on this proxy. Blocking any of
+    #     these takes a banking service down, so they can never enter a deny
+    #     list. Keep in sync with the cache_peer_access rules in squid.conf.
+    "igw.paygate2.example.com",          # PayGate2 gateway
+    "gw.paygate1.example.com", "uat-gw.paygate1.example.com",   # PaymentGateway1 gateway
+    "prportal.nid.example.gov",        # NID verification
+    "gateway.pension.example.gov",     # National Pension (NPA)
+    "examplebank.internal",                   # internal domains (.examplebank.internal)
+]
+
+# Ordinary URLs a url_regex must not match — catches patterns broad enough to
+# take the whole organisation offline.
+CANARY_URLS = [
+    "http://www.cb.example.gov/index.html",
+    "http://windowsupdate.microsoft.com/v9/update.cab",
+    "http://www.google.com/search?q=test",
+    "http://intranet.local/app/login",
+]
+
+MODES = {
+    "deny_all": "no internet at all",
+    "unrestricted": "full internet (still subject to the security tier)",
+    "allowlist_only": "may reach ONLY its allow lists, everything else denied",
+    "restricted": "normal access minus this group's deny lists",
+}
+
+ID_RE = re.compile(r"^[a-z][a-z0-9_]{1,23}$")
+DOMAIN_RE = re.compile(
+    r"^\.?([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$")
+
+MIN_PREFIX_HARD = 8      # never allow anything broader than /8
+MIN_PREFIX_WARN = 16     # /8../15 needs "confirm_broad": true on the group
+MAX_GROUPS = 100
+MAX_ENTRIES = 5000
+
+
+class Refuse(Exception):
+    """Validation failure that should abort with a specific exit code."""
+    def __init__(self, msg, code=2):
+        super().__init__(msg)
+        self.code = code
+
+
+# --------------------------------------------------------------------------- #
+#  helpers
+# --------------------------------------------------------------------------- #
+
+ACTING = {"user": None, "from": None}       # set from --acting-user/--acting-from
+
+
+def _clean_field(v, limit=64):
+    """One safe token for the audit log — no separators, no control chars.
+
+    The operator name arrives from the dashboard, so it must not be able to
+    forge extra tab-separated columns or extra log lines.
+    """
+    s = "".join(c for c in str(v or "") if c.isprintable() and c not in "\t\n\r")
+    return s[:limit]
+
+
+def audit(msg):
+    # The acting user comes from the dashboard's signed-in session, so a change
+    # made through the web UI is attributable to the person who made it rather
+    # than to the service account the dashboard runs as. Advisory only: the
+    # sudoers grant decides what may run, so a forged value cannot widen
+    # access — it would only mislabel the log, and the real account is still
+    # recorded as sudo=.
+    who = (_clean_field(ACTING.get("user"))
+           or _clean_field(os.environ.get("SQUID_POLICY_ACTING_USER"))
+           or os.environ.get("SUDO_USER") or os.environ.get("USER")
+           or "unknown")
+    real = os.environ.get("SUDO_USER") or os.environ.get("USER") or ""
+    if real and who != real:
+        who = f"{who}(sudo={real})"
+    frm = (_clean_field(ACTING.get("from"))
+           or _clean_field(os.environ.get("SQUID_POLICY_ACTING_FROM"))
+           or (os.environ.get("SSH_CLIENT") or "local").split(" ")[0])
+    try:
+        os.makedirs(os.path.dirname(AUDIT), exist_ok=True)
+        with open(AUDIT, "a") as fh:
+            fh.write(f"{time.strftime('%Y-%m-%dT%H:%M:%S%z')}\tuser={who}"
+                     f"\tfrom={frm}\t{msg}\n")
+    except OSError:
+        pass
+
+
+def self_check():
+    """A user-writable helper plus a sudoers grant equals root. Refuse that."""
+    me = os.path.realpath(sys.argv[0])
+    if not os.path.exists(me):
+        return
+    st = os.stat(me)
+    if st.st_uid != 0:
+        raise Refuse(f"{me} must be owned by root (uid {st.st_uid})", 5)
+    if st.st_mode & 0o022:
+        raise Refuse(f"{me} is group/world-writable — chmod 0755", 5)
+
+
+def norm_domain(v):
+    v = str(v).strip().lower()
+    if not DOMAIN_RE.match(v) or ".." in v or len(v) > 253:
+        raise Refuse(f"not a valid domain: {v!r}")
+    return v
+
+
+def is_protected(domain, extra=()):
+    """Return the protected domain this entry would take down, or None.
+
+    Two directions must both be checked, because deny entries are compiled to
+    the dot form (".d.com", matching the apex AND all subdomains):
+
+      1. the entry IS protected, or sits under one
+         e.g. "gw.paygate1.example.com" when "gw.paygate1.example.com" is protected
+      2. the entry would SWALLOW a protected domain as a subdomain
+         e.g. blocking "paygate1.example.com" compiles to ".paygate1.example.com", which captures
+         the protected payment host gw.paygate1.example.com; likewise "gov.bd" would
+         capture prportal.nid.example.gov, and "org.bd" would capture cb.example.gov
+
+    Only direction 1 was checked originally. That was harmless while entries
+    compiled to a bare exact-match form, but became a live outage risk the
+    moment they compiled to the dot form — an operator blocking "paygate1.example.com"
+    from the dashboard would have silently killed the payment gateway.
+    """
+    d = domain.lstrip(".").lower()
+    for p in list(PROTECTED) + list(extra):
+        p = str(p).lstrip(".").lower()
+        if d == p or d.endswith("." + p):      # direction 1
+            return p
+        if p.endswith("." + d):                # direction 2
+            return p
+    return None
+
+
+def norm_ip(v, allow_broad=False):
+    v = str(v).strip()
+    ip, _, pfx = v.partition("/")
+    prefix = int(pfx) if pfx else 32
+    octets = ip.split(".")
+    if len(octets) != 4:
+        raise Refuse(f"not a valid IPv4 address: {v!r}")
+    for o in octets:
+        if not o.isdigit() or not 0 <= int(o) <= 255:
+            raise Refuse(f"not a valid IPv4 address: {v!r}")
+    if not 0 <= prefix <= 32:
+        raise Refuse(f"invalid prefix length in {v!r}")
+    if prefix < MIN_PREFIX_HARD:
+        raise Refuse(f"/{prefix} is far too broad ({v}) — refusing", 5)
+    if prefix < MIN_PREFIX_WARN and not allow_broad:
+        raise Refuse(f"/{prefix} covers a very large range ({v}). If that is "
+                     f"intended, set \"confirm_broad\": true on the group", 5)
+    return f"{ip}/{prefix}" if pfx else ip
+
+
+def ip_key(v):
+    """Normalised key for overlap detection (exact duplicates only)."""
+    return norm_ip(v, allow_broad=True)
+
+
+def check_regex(pat, protected_extra=()):
+    """A url_regex is powerful — validate it hard before it reaches Squid."""
+    pat = str(pat).strip()
+    if len(pat) < 4:
+        raise Refuse(f"url pattern too short (min 4 chars): {pat!r}")
+    if len(pat) > 400:
+        raise Refuse("url pattern too long")
+    if pat in (".*", "^.*", "^.*$", ".", ".+", "^", "$", "//", "http", "https",
+               "http.*", "https.*"):
+        raise Refuse(f"pattern {pat!r} would deny everything", 5)
+    # Squid's url_regex ACL compiles with POSIX Extended Regular Expressions
+    # (glibc regcomp()), NOT PCRE/Perl regex. Python's `re` module is far more
+    # permissive than POSIX ERE and will happily accept constructs that make
+    # Squid fail at `squid -k parse` time with "invalid regular expression" —
+    # or worse, silently SKIP the rule while the rest of the config parses
+    # fine, disabling the intended block without any obvious error. Reject
+    # the common PCRE-only constructs up front, in plain terms, before this
+    # ever reaches a live proxy.
+    _PCRE_ONLY = (
+        (r"\b", r"word-boundary \b is PCRE-only; drop it (Squid's dstdomain/"
+                 r"substring matching usually makes it unnecessary)"),
+        (r"(?:", r"non-capturing group (?:...) is PCRE-only; use a plain "
+                  r"group (...) instead"),
+        (r"(?=", r"lookahead (?=...) is not supported by POSIX ERE"),
+        (r"(?!", r"negative lookahead (?!...) is not supported by POSIX ERE"),
+        (r"(?<", r"lookbehind (?<...) is not supported by POSIX ERE"),
+        (r"(?P", r"named group (?P<...>) is not supported by POSIX ERE"),
+        (r"\d", r"\\d is PCRE-only; use [0-9] or [[:digit:]] instead"),
+        (r"\w", r"\\w is PCRE-only; use [A-Za-z0-9_] or [[:alnum:]_] instead"),
+        (r"\s", r"\\s is PCRE-only; use [[:space:]] instead"),
+        (r"\A", r"\\A is PCRE-only; use ^ instead"),
+        (r"\Z", r"\\Z is PCRE-only; use $ instead"),
+    )
+    for token, why in _PCRE_ONLY:
+        if token in pat:
+            raise Refuse(
+                f"pattern {pat!r} uses {token!r}, which Squid's url_regex "
+                f"cannot parse (POSIX ERE, not PCRE): {why}", 5)
+    try:
+        rx = re.compile(pat)
+    except re.error as e:
+        raise Refuse(f"not a valid regular expression: {pat!r} ({e})")
+    try:
+        gp = subprocess.run(["grep", "-E", "-q", "--", pat, "/dev/null"],
+                             timeout=5)
+        # grep -E exits 2 on a genuinely malformed ERE (exit 0/1 both mean the
+        # syntax compiled, whether or not /dev/null "matched"). This is a
+        # second, independent opinion from the same POSIX ERE family Squid
+        # links against on Linux, on top of the explicit PCRE-token denylist
+        # above (grep -E can be more lenient than Squid's own compiler on some
+        # edge cases, so the denylist stays authoritative — this is a
+        # belt-and-suspenders extra check, not a replacement for it).
+        if gp.returncode == 2:
+            raise Refuse(f"pattern {pat!r} is not a valid POSIX ERE "
+                         f"(grep -E rejected it)", 5)
+    except (OSError, subprocess.SubprocessError):
+        pass  # grep unavailable — fall back to the checks above only
+    for p in list(PROTECTED) + list(protected_extra):
+        for scheme in ("http", "https"):
+            for probe in (f"{scheme}://{p}/", f"{scheme}://www.{p}/some/path"):
+                if rx.search(probe):
+                    raise Refuse(f"pattern {pat!r} would also block protected "
+                                 f"domain {p!r}", 5)
+    for u in CANARY_URLS:
+        if rx.search(u):
+            raise Refuse(f"pattern {pat!r} is too broad — it matches ordinary "
+                         f"traffic ({u})", 5)
+    return pat
+
+
+# --------------------------------------------------------------------------- #
+#  policy validation
+# --------------------------------------------------------------------------- #
+
+def validate(policy):
+    """Return a normalised policy or raise Refuse. Pure — no side effects."""
+    if not isinstance(policy, dict):
+        raise Refuse("policy must be a JSON object")
+
+    allow_extra = [norm_domain(d) for d in
+                   (policy.get("global_allow", {}) or {}).get("domains", [])]
+
+    out = {
+        "groups": [],
+        "security_block": {"domains": [], "urls": []},
+        "policy_block": {"domains": [], "urls": []},
+        "global_allow": {"domains": allow_extra},
+        "options": {},
+    }
+
+    opts = policy.get("options") or {}
+    out["options"] = {
+        "drop_connection": bool(opts.get("drop_connection", False)),
+        "deny_raw_ip_urls": bool(opts.get("deny_raw_ip_urls", True)),
+        "deny_executables": bool(opts.get("deny_executables", False)),
+        "note": str(opts.get("note", ""))[:200],
+    }
+
+    # ---- destination tiers ---------------------------------------------- #
+    for tier in ("security_block", "policy_block"):
+        src = policy.get(tier) or {}
+        for d in src.get("domains", []) or []:
+            dn = norm_domain(d)
+            hit = is_protected(dn, allow_extra)
+            if hit:
+                raise Refuse(f"{tier}: {dn} is protected (matches {hit}) — "
+                             f"remove it or add it to global_allow", 5)
+            out[tier]["domains"].append(dn)
+        for u in src.get("urls", []) or []:
+            out[tier]["urls"].append(check_regex(u, allow_extra))
+
+    # ---- groups ---------------------------------------------------------- #
+    seen_ids, ip_owner = set(), {}
+    groups = policy.get("groups") or []
+    if len(groups) > MAX_GROUPS:
+        raise Refuse(f"too many groups (max {MAX_GROUPS})")
+
+    for raw in groups:
+        if not isinstance(raw, dict):
+            raise Refuse("each group must be an object")
+        gid = str(raw.get("id", "")).strip().lower()
+        if not ID_RE.match(gid):
+            raise Refuse(f"invalid group id {gid!r} — use lowercase letters, "
+                         f"digits and underscore (2-24 chars)")
+        if gid in seen_ids:
+            raise Refuse(f"duplicate group id {gid!r}")
+        seen_ids.add(gid)
+
+        mode = str(raw.get("mode", "restricted")).strip()
+        if mode not in MODES:
+            raise Refuse(f"group {gid}: unknown mode {mode!r} "
+                         f"(use {'/'.join(MODES)})")
+        if raw.get("enabled") is False:
+            continue
+
+        broad_ok = bool(raw.get("confirm_broad", False))
+        ips = []
+        for v in raw.get("ips", []) or []:
+            ip = norm_ip(v, allow_broad=broad_ok)
+            key = ip_key(ip)
+            if key in ip_owner:
+                raise Refuse(f"{ip} is in both {ip_owner[key]!r} and {gid!r}. "
+                             f"Squid matches the first rule only, so an IP must "
+                             f"belong to exactly one group", 5)
+            ip_owner[key] = gid
+            ips.append(ip)
+        if not ips:
+            # An empty group is a placeholder waiting to be filled in, not an
+            # error — the shipped baseline ships several. Skip it so a fresh
+            # install applies cleanly, and record it for the summary.
+            out.setdefault("_skipped", []).append(gid)
+            continue
+
+        g = {"id": gid, "name": str(raw.get("name") or gid)[:60], "mode": mode,
+             "ips": ips, "deny_domains": [], "deny_urls": [],
+             "allow_domains": [], "allow_urls": [],
+             "confirm_broad": broad_ok}
+
+        for d in raw.get("deny_domains", []) or []:
+            dn = norm_domain(d)
+            hit = is_protected(dn, allow_extra)
+            if hit:
+                raise Refuse(f"group {gid}: {dn} is protected (matches {hit})", 5)
+            g["deny_domains"].append(dn)
+        for u in raw.get("deny_urls", []) or []:
+            g["deny_urls"].append(check_regex(u, allow_extra))
+        for d in raw.get("allow_domains", []) or []:
+            g["allow_domains"].append(norm_domain(d))
+        for u in raw.get("allow_urls", []) or []:
+            # allow patterns don't endanger anything, only sanity-check them
+            up = str(u).strip()
+            if len(up) < 4:
+                raise Refuse(f"group {gid}: allow url pattern too short: {up!r}")
+            try:
+                re.compile(up)
+            except re.error as e:
+                raise Refuse(f"group {gid}: bad allow regex {up!r} ({e})")
+            g["allow_urls"].append(up)
+
+        if mode == "allowlist_only" and not (g["allow_domains"] or g["allow_urls"]):
+            raise Refuse(f"group {gid} is allowlist_only but has no allow "
+                         f"entries — those IPs would lose all internet access. "
+                         f"Add allow_domains, or use mode deny_all if that is "
+                         f"what you want", 5)
+        if mode == "deny_all" and (g["deny_domains"] or g["allow_domains"]):
+            g["deny_domains"], g["allow_domains"] = [], []   # meaningless here
+
+        total = sum(len(g[k]) for k in
+                    ("ips", "deny_domains", "deny_urls", "allow_domains", "allow_urls"))
+        if total > MAX_ENTRIES:
+            raise Refuse(f"group {gid}: too many entries ({total})")
+        out["groups"].append(g)
+
+    return out
+
+
+# --------------------------------------------------------------------------- #
+#  config generation
+# --------------------------------------------------------------------------- #
+
+def expand_domains(values):
+    """Emit exactly ONE dot-prefixed form per domain, for dstdomain ACLs.
+
+    Squid's dstdomain distinguishes the two forms:
+      "dropbox.com"   matches ONLY the exact host dropbox.com
+      ".dropbox.com"  matches dropbox.com AND every subdomain of it
+    and Squid 5.5+ hard-rejects a list holding both ("'.d.com' is a subdomain
+    of 'd.com'", FATAL, refuses to start), so exactly one form must be chosen.
+
+    Blocking a service means blocking its subdomains too — nobody wants
+    dropbox.com denied while www.dropbox.com sails through — so the dot form
+    is the only correct choice here.
+
+    Both wrong answers were tried against a real Squid 5.5 before this
+    landed: emitting both forms made Squid refuse to start, and emitting the
+    bare form silently let www.<domain> through while the apex was blocked
+    (caught only by spotting a live TCP_TUNNEL/200 for www.dropbox.com in
+    access.log minutes after the policy had "successfully" applied). The dot
+    form does not over-match: ".dropbox.com" will not match "notdropbox.com".
+    """
+    out = []
+    for v in values:
+        d = str(v).strip().lower().lstrip(".")
+        if not d:
+            continue
+        dotted = "." + d
+        if dotted not in out:
+            out.append(dotted)
+    return out
+
+
+def write_list(name, values, domains=False):
+    """One ACL list file. Never left empty — Squid rejects a memberless ACL."""
+    path = os.path.join(LISTS, name)
+    body = [v for v in values if str(v).strip()]
+    if domains:
+        body = expand_domains(body)
+    if not body:
+        body = ["# placeholder keeps this ACL non-empty",
+                "blocked.invalid" if "url" not in name else
+                r"^https?://blocked\.invalid/"]
+    tmp = path + ".tmp"
+    with open(tmp, "w") as fh:
+        fh.write("# generated by squid-policy — do not edit by hand\n")
+        for v in body:
+            fh.write(f"{v}\n")
+    os.replace(tmp, path)
+    return path
+
+
+def generate(policy):
+    """Render the include file. Order matters: http_access is first-match-wins."""
+    os.makedirs(LISTS, exist_ok=True)
+    L, A = [], []                    # L: acl definitions, A: http_access rules
+    opts = policy["options"]
+    drop = opts["drop_connection"]
+    deny_info = []
+
+    def acl(name, atype, values, fname):
+        path = write_list(fname, values, domains=(atype == "dstdomain"))
+        L.append(f'acl {name} {atype} "{path}"')
+
+    # ---- 0. curated exceptions ------------------------------------------- #
+    ga = policy["global_allow"]["domains"]
+    if ga:
+        acl("pol_global_allow", "dstdomain", ga, "global_allow_domains.txt")
+
+    # ---- 1. groups ------------------------------------------------------- #
+    for g in policy["groups"]:
+        gid = g["id"]
+        if g["mode"] == "allowlist_only":
+            # protected destinations are always permitted, so an allowlist-only
+            # host cannot be cut off from Windows Update or the payment rails
+            for d in PROTECTED:
+                if d not in g["allow_domains"]:
+                    g["allow_domains"].append(d)
+        acl(f"grp_{gid}", "src", g["ips"], f"group_{gid}_ips.txt")
+        if g["deny_domains"]:
+            acl(f"grp_{gid}_deny_dom", "dstdomain", g["deny_domains"],
+                f"group_{gid}_deny_domains.txt")
+        if g["deny_urls"]:
+            acl(f"grp_{gid}_deny_url", "url_regex", g["deny_urls"],
+                f"group_{gid}_deny_urls.txt")
+        if g["allow_domains"]:
+            acl(f"grp_{gid}_allow_dom", "dstdomain", g["allow_domains"],
+                f"group_{gid}_allow_domains.txt")
+        if g["allow_urls"]:
+            acl(f"grp_{gid}_allow_url", "url_regex", g["allow_urls"],
+                f"group_{gid}_allow_urls.txt")
+
+    # ---- 2. destination tiers ------------------------------------------- #
+    sec, pol = policy["security_block"], policy["policy_block"]
+    if sec["domains"]:
+        acl("pol_sec_dom", "dstdomain", sec["domains"], "security_domains.txt")
+    if sec["urls"]:
+        acl("pol_sec_url", "url_regex", sec["urls"], "security_urls.txt")
+    if pol["domains"]:
+        acl("pol_blk_dom", "dstdomain", pol["domains"], "policy_domains.txt")
+    if pol["urls"]:
+        acl("pol_blk_url", "url_regex", pol["urls"], "policy_urls.txt")
+    if opts["deny_raw_ip_urls"]:
+        L.append(r'acl pol_raw_ip_url url_regex ^[a-z]+://[0-9]{1,3}\.[0-9]{1,3}\.')
+        # internal services are routinely addressed by IP — only a raw PUBLIC
+        # IP indicates DNS evasion, so exempt the private ranges
+        L.append("acl pol_private_dst dst 10.0.0.0/8 172.16.0.0/12 "
+                 "192.168.0.0/16 127.0.0.0/8 169.254.0.0/16 100.64.0.0/10")
+    if opts["deny_executables"]:
+        L.append(r'acl pol_exe_url url_regex -i \.(exe|scr|bat|cmd|com|pif|msi|'
+                 r'vbs|js|jar|ps1)(\?|$)')
+
+    # ---- 3. rules, in the only safe order -------------------------------- #
+    A.append("# 1) hard deny — these clients get no internet at all")
+    for g in policy["groups"]:
+        if g["mode"] == "deny_all":
+            A.append(f"http_access deny grp_{g['id']}    # {g['name']}")
+            deny_info.append(f"grp_{g['id']}")
+
+    if ga:
+        A.append("")
+        A.append("# 2) curated exceptions — these win over every block below")
+        A.append("http_access allow pol_global_allow")
+
+    A.append("")
+    A.append("# 3) security tier — applies to EVERYONE, including unrestricted")
+    for nm in ("pol_sec_dom", "pol_sec_url"):
+        if any(nm in line for line in L):
+            A.append(f"http_access deny {nm}")
+            deny_info.append(nm)
+    if opts["deny_raw_ip_urls"]:
+        A.append("http_access deny pol_raw_ip_url !pol_private_dst"
+                 "    # raw public IP only; internal IPs stay reachable")
+        deny_info.append("pol_raw_ip_url")
+
+    A.append("")
+    A.append("# 4) per-group destination denies")
+    for g in policy["groups"]:
+        if g["mode"] in ("deny_all", "allowlist_only"):
+            continue
+        for suffix, nm in (("deny_dom", "domains"), ("deny_url", "URLs")):
+            if any(f"grp_{g['id']}_{suffix} " in line for line in L):
+                A.append(f"http_access deny grp_{g['id']} grp_{g['id']}_{suffix}"
+                         f"    # {g['name']}: blocked {nm}")
+                deny_info.append(f"grp_{g['id']}_{suffix}")
+
+    A.append("")
+    A.append("# 5) allowlist-only groups — allow their list, then deny the rest")
+    for g in policy["groups"]:
+        if g["mode"] != "allowlist_only":
+            continue
+        for suffix in ("allow_dom", "allow_url"):
+            if any(f"grp_{g['id']}_{suffix} " in line for line in L):
+                A.append(f"http_access allow grp_{g['id']} grp_{g['id']}_{suffix}"
+                         f"    # {g['name']}: permitted")
+        A.append(f"http_access deny grp_{g['id']}"
+                 f"    # {g['name']}: everything else denied")
+        deny_info.append(f"grp_{g['id']}")
+
+    A.append("")
+    A.append("# 6) unrestricted groups — bypass the policy tier below,")
+    A.append("#    but the security tier above already applied to them")
+    for g in policy["groups"]:
+        if g["mode"] == "unrestricted":
+            A.append(f"http_access allow grp_{g['id']}    # {g['name']}")
+
+    A.append("")
+    A.append("# 7) policy tier — everyone else")
+    for nm in ("pol_blk_dom", "pol_blk_url"):
+        if any(nm in line for line in L):
+            A.append(f"http_access deny {nm}")
+            deny_info.append(nm)
+    if opts["deny_executables"]:
+        A.append("http_access deny pol_exe_url")
+        deny_info.append("pol_exe_url")
+
+    # ---- optional early-deny companion ---------------------------------- #
+    # Some sites must allow a narrow exception (e.g. SSH over CONNECT) BEFORE
+    # the generic port guards, which means those requests would never reach the
+    # main include. This small file re-states the hard denials so it can be
+    # included earlier, above such exceptions.
+    pre = ["# GENERATED BY squid-policy — optional early-deny layer",
+           "# Include this ABOVE any narrow 'http_access allow' exception that",
+           "# must otherwise bypass policy (for example SSH over CONNECT).",
+           ""]
+    for g in policy["groups"]:
+        if g["mode"] == "deny_all":
+            path = os.path.join(LISTS, f"group_{g['id']}_ips.txt")
+            pre.append(f'acl grp_{g["id"]} src "{path}"')
+    if any(g["mode"] == "deny_all" for g in policy["groups"]):
+        pre.append("")
+        for g in policy["groups"]:
+            if g["mode"] == "deny_all":
+                pre.append(f"http_access deny grp_{g['id']}    # {g['name']}")
+        if drop:
+            pre.append("")
+            for g in policy["groups"]:
+                if g["mode"] == "deny_all":
+                    pre.append(f"deny_info TCP_RESET grp_{g['id']}")
+    else:
+        pre.append("# (no deny_all groups configured — this file is a no-op)")
+    pre.append("")
+    tmp = RULES_PRE + ".tmp"
+    with open(tmp, "w") as fh:
+        fh.write("\n".join(pre))
+    os.chmod(tmp, 0o644)
+    os.replace(tmp, RULES_PRE)
+
+    stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+    head = [
+        "# ==========================================================",
+        "#  GENERATED BY squid-policy — DO NOT EDIT",
+        f"#  generated: {stamp}",
+        f"#  source   : {POLICY}",
+        "#",
+        "#  Included from squid.conf. Because http_access is first-match-wins,",
+        "#  the include line must sit ABOVE the site's own 'http_access allow'",
+        "#  rules, and below the Safe_ports/CONNECT denials.",
+        "# ==========================================================",
+        "",
+        "# ---- ACL definitions ----",
+    ]
+    body = head + L + ["", "# ---- access rules (order is significant) ----"] + A
+    if drop and deny_info:
+        body += ["", "# ---- blocked requests get a TCP reset, not a 403 page ----"]
+        body += [f"deny_info TCP_RESET {n}" for n in dict.fromkeys(deny_info)]
+    body += ["", "# ---- end of generated policy ----", ""]
+    return "\n".join(body)
+
+
+# --------------------------------------------------------------------------- #
+#  apply / rollback
+# --------------------------------------------------------------------------- #
+
+def squid_running():
+    try:
+        return subprocess.run(["pgrep", "-x", "squid"], capture_output=True,
+                              timeout=10).returncode == 0
+    except Exception:                                          # noqa: BLE001
+        return False
+
+
+SAFE_PLACEHOLDER = (
+    "# squid-policy: no valid configuration has been applied yet.\n"
+    "# This file is intentionally left empty (a harmless no-op) so that the\n"
+    "# `include` line in squid.conf keeps resolving to a real file instead of\n"
+    "# a missing one. Fix the reported error and run `squid-policy apply`\n"
+    "# again.\n"
+)
+
+
+def _print_squid_diagnostics(output):
+    """Surface the real error instead of Squid's fixed-length exit banner.
+
+    Squid always ends a failed run with the same 4-line summary
+    ("Terminated abnormally" / "CPU Usage" / "Maximum Resident Size" /
+    "Page faults") — printing only the last 4 lines of output (the old
+    behaviour here) therefore ALWAYS hides the actual `FATAL:`/`ERROR:` line,
+    which appears earlier. This was found live: a dstdomain conflict and
+    later a bad url_regex both had their real cause masked for several retry
+    attempts because only that trailing banner was ever shown.
+    """
+    lines = (output or "").strip().splitlines()
+    if not lines:
+        return
+    hits = [l for l in lines if ("FATAL" in l or "ERROR" in l
+                                  or "error" in l.lower())]
+    if hits:
+        print("\n".join(hits), file=sys.stderr)
+        banner = lines[-4:]
+        if banner and banner != hits[-len(banner):]:
+            print("--- squid exit summary ---", file=sys.stderr)
+            print("\n".join(banner), file=sys.stderr)
+    else:
+        # No recognisable marker — better to over-share than hide the cause.
+        print("\n".join(lines[-40:]), file=sys.stderr)
+
+
+def snapshot_lists():
+    """Copy the ACL value files aside so a failed apply can restore them.
+
+    generate() rewrites lists/*.txt before apply_config() gets a chance to
+    validate anything, and the file NAMES are stable. So restoring only
+    rules.conf after a rejected apply leaves the previous rules.conf reading
+    the NEW list contents — the proxy then enforces the rejected values while
+    policy.json still describes the old ones. Found by a fleet test where a
+    node reported a clean rollback but was quietly blocking the wrong domain.
+    """
+    if not os.path.isdir(LISTS):
+        return None
+    snap = {}
+    for name in os.listdir(LISTS):
+        p = os.path.join(LISTS, name)
+        if os.path.isfile(p):
+            try:
+                with open(p, "rb") as fh:
+                    snap[name] = fh.read()
+            except OSError:
+                pass
+    return snap
+
+
+def restore_lists(snap):
+    """Put the ACL value files back exactly as snapshot_lists() found them."""
+    if snap is None:
+        return
+    os.makedirs(LISTS, exist_ok=True)
+    for name, body in snap.items():
+        try:
+            with open(os.path.join(LISTS, name), "wb") as fh:
+                fh.write(body)
+        except OSError:
+            pass
+    # remove files that did not exist before, so a rejected apply cannot leave
+    # a brand-new list file behind for a later config to pick up
+    try:
+        for name in os.listdir(LISTS):
+            if name not in snap:
+                p = os.path.join(LISTS, name)
+                if os.path.isfile(p):
+                    os.remove(p)
+    except OSError:
+        pass
+
+
+def generate_and_apply(norm, what):
+    """generate() + apply_config(), with the ACL files restored on failure."""
+    snap = snapshot_lists()
+    try:
+        text = generate(norm)
+        apply_config(text, what)
+    except Refuse:
+        restore_lists(snap)
+        if squid_running():
+            # the values Squid has loaded must match the restored files
+            subprocess.run([SQUID_BIN, "-k", "reconfigure"],
+                           capture_output=True, timeout=60)
+        raise
+    return text
+
+
+def apply_config(text, what="apply"):
+    os.makedirs(BACKUPS, exist_ok=True)
+    prev = None
+    if os.path.exists(RULES):
+        prev = os.path.join(BACKUPS, f"rules.conf.{time.strftime('%Y%m%d-%H%M%S')}")
+        shutil.copy2(RULES, prev)
+    # keep the last 30 generations so this directory can't grow forever
+    try:
+        old = sorted(os.listdir(BACKUPS), reverse=True)[30:]
+        for f in old:
+            os.remove(os.path.join(BACKUPS, f))
+    except OSError:
+        pass
+
+    tmp = RULES + ".tmp"
+    with open(tmp, "w") as fh:
+        fh.write(text)
+    os.chmod(tmp, 0o644)
+    os.replace(tmp, RULES)
+
+    def restore(reason, code):
+        if prev:
+            shutil.copy2(prev, RULES)
+        else:
+            # No prior good generation exists yet (this is the very first
+            # apply). Deleting RULES here — the old behaviour — leaves
+            # squid.conf's `include RULES` line pointing at a file that no
+            # longer exists, which makes EVERY subsequent `squid -k parse`
+            # fail with a generic "Unable to find configuration file" error,
+            # no matter what gets fixed afterwards. That masked the real
+            # dstdomain/regex errors for multiple retries during live
+            # testing on 10.50.0.12. Write a harmless empty include
+            # instead so the file always exists and future retries surface
+            # their own real error.
+            with open(RULES, "w") as fh:
+                fh.write(SAFE_PLACEHOLDER)
+            os.chmod(RULES, 0o644)
+        if squid_running():
+            subprocess.run([SQUID_BIN, "-k", "reconfigure"],
+                           capture_output=True, timeout=60)
+        audit(f"ROLLBACK {what} — {reason}")
+        raise Refuse(f"{reason} — configuration rolled back", code)
+
+    r = subprocess.run([SQUID_BIN, "-k", "parse"], capture_output=True,
+                       text=True, timeout=60)
+    if r.returncode != 0:
+        _print_squid_diagnostics(r.stderr or r.stdout)
+        restore("squid rejected the generated config", 3)
+
+    if squid_running():
+        r = subprocess.run([SQUID_BIN, "-k", "reconfigure"], capture_output=True,
+                           text=True, timeout=60)
+        if r.returncode != 0:
+            _print_squid_diagnostics(r.stderr or r.stdout)
+            restore("squid reload failed", 4)
+        print("squid reloaded")
+    else:
+        print("note: squid is not running — config written, applies on start")
+
+
+def load_policy():
+    if not os.path.exists(POLICY):
+        raise Refuse(f"no policy file at {POLICY} — run `squid-policy init`")
+    with open(POLICY) as fh:
+        return json.load(fh)
+
+
+def save_policy(policy):
+    os.makedirs(DIR, exist_ok=True)
+    tmp = POLICY + ".tmp"
+    with open(tmp, "w") as fh:
+        json.dump(policy, fh, indent=2)
+    os.chmod(tmp, 0o600)          # may name internal hosts/IPs
+    os.replace(tmp, POLICY)
+
+
+# --------------------------------------------------------------------------- #
+#  baseline policy
+# --------------------------------------------------------------------------- #
+
+def baseline_policy():
+    """Industry-baseline starting point for a bank proxy."""
+    return {
+        "_comment": "squid-policy database. Edit via the dashboard or "
+                    "`squid-policy set`. Groups are evaluated in the documented "
+                    "order; an IP may belong to exactly one group.",
+        "options": {
+            "drop_connection": False,
+            "deny_raw_ip_urls": True,
+            "deny_executables": False,
+            "note": "baseline",
+        },
+        "global_allow": {"domains": []},
+        "security_block": {
+            "domains": [
+                "anydesk.com", "teamviewer.com", "logmein.com", "rustdesk.com",
+                "ngrok.com", "ngrok.io", "trycloudflare.com", "localtunnel.me",
+                "torproject.org", "nordvpn.com", "expressvpn.com",
+                "protonvpn.com", "surfshark.com", "windscribe.com",
+                "hotspotshield.com", "psiphon3.com", "vpngate.net",
+                "minexmr.com", "nanopool.org", "supportxmr.com", "f2pool.com",
+                "ethermine.org", "2miners.com", "xmrig.com",
+                "duckdns.org", "no-ip.com", "ddns.net", "dynu.com",
+                "hopto.org", "zapto.org", "sytes.net",
+            ],
+            "urls": [
+                # Squid's url_regex ACL compiles with POSIX Extended Regular
+                # Expressions (the glibc regcomp() family), NOT PCRE/Perl
+                # regex. \b (word boundary) and (?:...) (non-capturing group)
+                # are PCRE-only and make Squid 5.5 fail with "invalid regular
+                # expression" / "Invalid preceding regular expression" and
+                # SKIP the rule entirely (silently disabling the protection,
+                # even though `squid -k parse` otherwise completes). An
+                # earlier version of this list used \b and (?:...) and was
+                # never run against a real Squid binary until a live test on
+                # RHEL 9 / Squid 5.5 caught it. These equivalents are POSIX
+                # ERE-safe (verified with `grep -E`, which links the same
+                # regex engine Squid uses on Linux).
+                r"\.onion/",
+                r"^https?://[^/]*(malware|botnet|ransomware|keylogger)",
+                r"stratum\+tcp",
+            ],
+        },
+        "policy_block": {
+            "domains": [
+                "dropbox.com", "mega.nz", "mediafire.com", "wetransfer.com",
+                "sendspace.com", "terabox.com", "anonfiles.com", "gofile.io",
+                "pastebin.com", "privnote.com", "justpaste.it",
+                "protonmail.com", "mail.ru", "temp-mail.org", "mailinator.com",
+                "torrentz2.eu", "thepiratebay.org", "1337x.to",
+            ],
+            "urls": [
+                r"\.torrent(\?|$)",
+            ],
+        },
+        "groups": [
+            {
+                "id": "quarantine",
+                "name": "Quarantined hosts (no internet)",
+                "mode": "deny_all",
+                "enabled": True,
+                "ips": [],
+            },
+            {
+                "id": "it_admins",
+                "name": "IT / security team (unrestricted)",
+                "mode": "unrestricted",
+                "enabled": True,
+                "ips": [],
+            },
+            {
+                "id": "kiosk",
+                "name": "Kiosk / ATM hosts (allowlist only)",
+                "mode": "allowlist_only",
+                "enabled": True,
+                "ips": [],
+                "allow_domains": ["cb.example.gov", "centralbank.example.gov"],
+                "allow_urls": [],
+            },
+            {
+                "id": "staff",
+                "name": "General staff (extra restrictions)",
+                "mode": "restricted",
+                "enabled": True,
+                "ips": [],
+                "deny_domains": ["facebook.com", "youtube.com", "tiktok.com",
+                                 "instagram.com", "netflix.com"],
+                "deny_urls": [],
+            },
+        ],
+    }
+
+
+# --------------------------------------------------------------------------- #
+#  commands
+# --------------------------------------------------------------------------- #
+
+def cmd_init(_args):
+    os.makedirs(LISTS, exist_ok=True)
+    os.makedirs(BACKUPS, exist_ok=True)
+    fresh = not os.path.exists(POLICY)
+    if fresh:
+        save_policy(baseline_policy())
+    print(f"policy dir : {DIR}")
+    print(f"policy file: {POLICY} {'(created from baseline)' if fresh else '(kept)'}")
+    print(f"generated  : {RULES}")
+    print(f"early-deny : {RULES_PRE}  (optional, see below)")
+    print(f"""
+Add ONE line to squid.conf. It must sit:
+   * BELOW  your Safe_ports / CONNECT deny lines
+   * ABOVE  your own 'http_access allow localnet' (or equivalent)
+
+    include {RULES}
+
+Then:
+    {sys.argv[0]} apply
+""")
+    audit("INIT")
+
+
+def cmd_get(_args):
+    print(json.dumps(load_policy(), indent=2))
+
+
+def cmd_set(args):
+    raw = sys.stdin.read()
+    if not raw.strip():
+        raise Refuse("no JSON on stdin")
+    try:
+        incoming = json.loads(raw)
+    except ValueError as e:
+        raise Refuse(f"invalid JSON: {e}")
+    norm = validate(incoming)
+    if getattr(args, "dry_run", False):
+        # generate() writes lists/*.txt as a side effect, so a "dry run" that
+        # simply called it left NEW ACL values staged on the proxy under the
+        # existing file names — harmless until the next reload for any reason,
+        # at which point Squid would start enforcing a policy nobody applied.
+        # Render it, then put the files back exactly as they were.
+        snap = snapshot_lists()
+        try:
+            text = generate(norm)
+        finally:
+            restore_lists(snap)
+        print(json.dumps({
+            "ok": True, "dry_run": True,
+            "groups": [{"id": g["id"], "name": g["name"], "mode": g["mode"],
+                        "ips": len(g["ips"])} for g in norm["groups"]],
+            "skipped": norm.get("_skipped", []),
+            "rules": [l for l in text.splitlines()
+                      if l.startswith("http_access") or l.startswith("deny_info")],
+            "config": text,
+        }, indent=2))
+        return
+    generate_and_apply(norm, "set")
+    incoming["_normalised_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+    save_policy(incoming)
+    n = len(norm["groups"])
+    audit(f"SET {n} group(s), "
+          f"{sum(len(g['ips']) for g in norm['groups'])} ip(s)")
+    print(json.dumps({"ok": True, "applied": n,
+                      "ips": sum(len(g["ips"]) for g in norm["groups"]),
+                      "skipped": norm.get("_skipped", [])}))
+
+
+def cmd_apply(_args):
+    norm = validate(load_policy())
+    generate_and_apply(norm, "apply")
+    audit("APPLY")
+    print(f"applied: {len(norm['groups'])} group(s)")
+
+
+def cmd_validate(args):
+    norm = validate(load_policy())
+    print("policy is valid\n")
+    if args.show_config:
+        print(generate(norm))
+    else:
+        for g in norm["groups"]:
+            print(f"  {g['id']:<14} {g['mode']:<15} {len(g['ips'])} ip(s)")
+
+
+def include_present():
+    """Is the `include .../rules.conf` line actually in squid.conf?
+
+    Both halves must be true for a policy to be enforced: rules.conf has to
+    exist AND squid.conf has to include it. Miss the include and every push
+    still reports success while Squid never reads a word of it. squid.conf is
+    not world-readable and the sudoers grant covers only this helper, so an
+    external `grep` cannot answer the question — the helper has to.
+    """
+    try:
+        with open(SQUID_CONF) as fh:
+            body = "\n".join(l.split("#", 1)[0] for l in fh)
+    except OSError:
+        return None                      # unknown, not "missing"
+    return os.path.basename(RULES) in body
+
+
+def cmd_ready(_args):
+    """One machine-readable answer: is this proxy fully wired up?"""
+    inc = include_present()
+    rules = os.path.exists(RULES)
+    ok = bool(inc) and rules
+    print(json.dumps({
+        "ok": ok,
+        "include_line": ("present" if inc else
+                         "unknown (cannot read %s)" % SQUID_CONF if inc is None
+                         else "MISSING"),
+        "rules_conf": "present" if rules else "MISSING",
+        "squid_conf": SQUID_CONF,
+        "rules_path": RULES,
+        "note": ("ready" if ok else
+                 "policy changes would be accepted but NOT enforced"),
+    }))
+    if not ok:
+        sys.exit(2)
+
+
+def cmd_show(_args):
+    # `show` is a diagnostic command, so it must still report SOMETHING when
+    # the stored policy is invalid — that is exactly the moment an operator
+    # needs to see what is on disk. Refusing outright (the old behaviour) hid
+    # the stored policy behind the very validation error the operator was
+    # trying to diagnose, leaving no way to inspect it except reading the raw
+    # JSON by hand.
+    try:
+        norm = validate(load_policy())
+    except Refuse as e:
+        print(f"squid running : {'yes' if squid_running() else 'no'}")
+        print(f"generated file: {RULES} "
+              f"{'(present)' if os.path.exists(RULES) else '(MISSING — run apply)'}")
+        print(f"\nSTORED POLICY IS INVALID — it cannot be applied as-is:")
+        print(f"  {e}")
+        print(f"\nThe stored policy at {POLICY} is shown below unvalidated so "
+              f"you can\nsee what needs fixing. Nothing has been applied to "
+              f"Squid; the running\nconfiguration is unchanged.")
+        try:
+            raw = load_policy()
+        except Refuse:
+            return 2
+        for g in raw.get("groups", []):
+            print(f"  [{str(g.get('mode')):<14}] {g.get('name')}  ({g.get('id')})")
+            print(f"      ips  : {', '.join(g.get('ips') or []) or '(none)'}")
+        for tier in ("security_block", "policy_block"):
+            pats = (raw.get(tier) or {}).get("urls") or []
+            if pats:
+                print(f"  {tier} url patterns:")
+                for p in pats:
+                    print(f"      {p!r}")
+        return 2
+    print(f"squid running : {'yes' if squid_running() else 'no'}")
+    print(f"generated file: {RULES} "
+          f"{'(present)' if os.path.exists(RULES) else '(MISSING — run apply)'}")
+    inc = include_present()
+    print("squid.conf    : " + ("includes the policy file" if inc
+                                else "!! MISSING the include line — policy is "
+                                     "NOT enforced" if inc is False
+                                else "could not be read"))
+    o = norm["options"]
+    print(f"blocked requests: {'TCP reset (dropped)' if o['drop_connection'] else '403 error page'}")
+    print(f"security tier : {len(norm['security_block']['domains'])} domains, "
+          f"{len(norm['security_block']['urls'])} url patterns")
+    print(f"policy tier   : {len(norm['policy_block']['domains'])} domains, "
+          f"{len(norm['policy_block']['urls'])} url patterns")
+    print(f"global allow  : {len(norm['global_allow']['domains'])} domains")
+    print("\ngroups (evaluated in this order):")
+    for g in norm["groups"]:
+        print(f"  [{g['mode']:<14}] {g['name']}  ({g['id']})")
+        print(f"      ips  : {', '.join(g['ips']) or '(none)'}")
+        for k in ("deny_domains", "deny_urls", "allow_domains", "allow_urls"):
+            if g[k]:
+                print(f"      {k:<13}: {', '.join(g[k][:6])}"
+                      f"{' …' if len(g[k]) > 6 else ''}")
+
+
+def cmd_rollback(_args):
+    if not os.path.isdir(BACKUPS):
+        raise Refuse("no backups directory")
+    files = sorted(os.listdir(BACKUPS), reverse=True)
+    if not files:
+        raise Refuse("no backup to roll back to")
+    with open(os.path.join(BACKUPS, files[0])) as fh:
+        text = fh.read()
+    apply_config(text, f"rollback<-{files[0]}")
+    audit(f"ROLLBACK to {files[0]}")
+    print(f"rolled back to {files[0]}")
+
+
+def cmd_baseline(_args):
+    print(json.dumps(baseline_policy(), indent=2))
+
+
+# Automatic translations from PCRE-only syntax to the POSIX ERE that Squid's
+# url_regex actually compiles. Only mechanical, meaning-preserving rewrites
+# belong here; anything ambiguous is reported for a human to decide.
+PCRE_REPAIRS = (
+    (r"(?:", r"(", "non-capturing group (?:...) -> plain group (...)"),
+    (r"\b", r"", "word-boundary \\b removed (PCRE-only)"),
+    (r"\d", r"[0-9]", "\\d -> [0-9]"),
+    (r"\w", r"[A-Za-z0-9_]", "\\w -> [A-Za-z0-9_]"),
+    (r"\s", r"[[:space:]]", "\\s -> [[:space:]]"),
+    (r"\A", r"^", "\\A -> ^"),
+    (r"\Z", r"$", "\\Z -> $"),
+)
+UNREPAIRABLE = ((r"(?=", "lookahead"), (r"(?!", "negative lookahead"),
+                (r"(?<", "lookbehind"), (r"(?P", "named group"))
+
+
+def repair_pattern(pat):
+    """Return (new_pattern, [notes]) — mechanically POSIX-ERE-safe."""
+    notes = []
+    for token, label in UNREPAIRABLE:
+        if token in pat:
+            return None, [f"{label} {token!r} has no POSIX ERE equivalent — "
+                          f"rewrite this pattern by hand"]
+    new = pat
+    for token, repl, label in PCRE_REPAIRS:
+        if token in new:
+            new = new.replace(token, repl)
+            notes.append(label)
+    return new, notes
+
+
+# --------------------------------------------------------------------------- #
+#  raw squid.conf editing
+# --------------------------------------------------------------------------- #
+
+def conf_guards(text, force=False):
+    """Refuse edits that break the proxy in ways Squid itself will not catch.
+
+    `squid -k parse` accepts plenty of configs that are operationally wrong.
+    These two in particular are silent and severe:
+
+      * dropping the `include .../rules.conf` line — Squid starts happily and
+        every per-IP rule simply stops existing, so the UI keeps showing a
+        policy that is no longer enforced
+      * dropping the final `http_access deny all` — the proxy becomes
+        fail-open, allowing whatever the earlier rules did not explicitly
+        cover
+
+    Both are overridable, because there are legitimate reasons to restructure
+    a config, but never by accident and always recorded in the audit log.
+    """
+    problems = []
+    body = "\n".join(l.split("#", 1)[0] for l in text.splitlines())
+    if os.path.basename(RULES) not in body:
+        problems.append(
+            f"the `include {RULES}` line is gone — Squid would still start, but "
+            f"every per-IP policy rule would stop being enforced")
+    if not re.search(r"^\s*http_access\s+deny\s+all\s*$", body, re.M):
+        problems.append(
+            "there is no `http_access deny all` left — the proxy would "
+            "fail open, allowing anything the earlier rules do not cover")
+    if not re.search(r"^\s*http_port\s+\d+", body, re.M):
+        problems.append("no `http_port` line — Squid would not listen at all")
+    if force:
+        return [f"OVERRIDDEN: {p}" for p in problems]
+    if problems:
+        raise Refuse("refusing to save: " + " | ".join(problems)
+                     + "  (pass --force to override deliberately)", 5)
+    return []
+
+
+def apply_squid_conf(text, force=False):
+    """Validate, back up, install and reload — rolling back on any failure."""
+    if not text.strip():
+        raise Refuse("refusing to write an empty squid.conf", 5)
+    if len(text) > CONF_MAX:
+        raise Refuse(f"squid.conf larger than {CONF_MAX // 1024} KB — refusing", 5)
+    overrides = conf_guards(text, force)
+
+    os.makedirs(CONF_BACKUPS, exist_ok=True)
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    backup = os.path.join(CONF_BACKUPS, f"squid.conf.{stamp}")
+    prev = None
+    if os.path.exists(SQUID_CONF):
+        shutil.copy2(SQUID_CONF, backup)
+        prev = backup
+    try:                                     # keep the last 40 generations
+        old = sorted(os.listdir(CONF_BACKUPS), reverse=True)[40:]
+        for f in old:
+            os.remove(os.path.join(CONF_BACKUPS, f))
+    except OSError:
+        pass
+
+    st = os.stat(SQUID_CONF) if os.path.exists(SQUID_CONF) else None
+    tmp = SQUID_CONF + ".sqpol.tmp"
+    with open(tmp, "w") as fh:
+        fh.write(text if text.endswith("\n") else text + "\n")
+    if st:
+        os.chmod(tmp, st.st_mode & 0o7777)
+        try:
+            os.chown(tmp, st.st_uid, st.st_gid)
+        except OSError:
+            pass
+    os.replace(tmp, SQUID_CONF)
+
+    def rollback(reason, code):
+        if prev:
+            shutil.copy2(prev, SQUID_CONF)
+            if squid_running():
+                subprocess.run([SQUID_BIN, "-k", "reconfigure"],
+                               capture_output=True, timeout=60)
+        audit(f"CONF ROLLBACK — {reason}")
+        raise Refuse(f"{reason} — squid.conf restored from {prev or '(no backup)'}",
+                     code)
+
+    r = subprocess.run([SQUID_BIN, "-k", "parse"], capture_output=True,
+                       text=True, timeout=60)
+    if r.returncode != 0:
+        _print_squid_diagnostics(r.stderr or r.stdout)
+        rollback("squid rejected the new squid.conf", 3)
+
+    if squid_running():
+        r = subprocess.run([SQUID_BIN, "-k", "reconfigure"], capture_output=True,
+                           text=True, timeout=60)
+        if r.returncode != 0:
+            _print_squid_diagnostics(r.stderr or r.stdout)
+            rollback("reload failed with the new squid.conf", 4)
+        reloaded = True
+    else:
+        reloaded = False
+    audit(f"CONF SAVE ok backup={os.path.basename(backup)}"
+          + ("".join(" " + o for o in overrides) if overrides else ""))
+    return {"ok": True, "backup": os.path.basename(backup),
+            "reloaded": reloaded, "overrides": overrides,
+            "bytes": len(text)}
+
+
+def cmd_conf_get(_args):
+    if not os.path.exists(SQUID_CONF):
+        raise Refuse(f"{SQUID_CONF} does not exist", 2)
+    with open(SQUID_CONF) as fh:
+        text = fh.read()
+    print(json.dumps({"ok": True, "path": SQUID_CONF, "text": text,
+                      "bytes": len(text),
+                      "mtime": os.path.getmtime(SQUID_CONF)}))
+
+
+def cmd_conf_check(args):
+    """Validate a candidate squid.conf from stdin WITHOUT installing it."""
+    text = sys.stdin.read()
+    if not text.strip():
+        raise Refuse("expected the new squid.conf on stdin", 2)
+    warnings = conf_guards(text, force=True)
+    blocking = [w[len("OVERRIDDEN: "):] for w in warnings]
+    # parse it for real, in a temporary location, without touching the live file
+    tmpdir = os.path.join(DIR, ".confcheck")
+    os.makedirs(tmpdir, exist_ok=True)
+    probe = os.path.join(tmpdir, "squid.conf")
+    with open(probe, "w") as fh:
+        fh.write(text)
+    r = subprocess.run([SQUID_BIN, "-k", "parse", "-f", probe],
+                       capture_output=True, text=True, timeout=60)
+    out = (r.stderr or r.stdout or "")
+    bad = [l for l in out.splitlines() if "FATAL" in l or "ERROR" in l]
+    try:
+        os.remove(probe)
+    except OSError:
+        pass
+    print(json.dumps({"ok": r.returncode == 0 and not blocking,
+                      "parses": r.returncode == 0,
+                      "guards": blocking,
+                      "squid_errors": bad[:20],
+                      "would_force": bool(blocking)}))
+    if r.returncode != 0 or blocking:
+        sys.exit(2)
+
+
+def cmd_conf_save(args):
+    text = sys.stdin.read()
+    print(json.dumps(apply_squid_conf(text, force=getattr(args, "force", False))))
+
+
+def cmd_conf_backups(_args):
+    if not os.path.isdir(CONF_BACKUPS):
+        print(json.dumps({"ok": True, "backups": []}))
+        return
+    out = []
+    for f in sorted(os.listdir(CONF_BACKUPS), reverse=True):
+        p = os.path.join(CONF_BACKUPS, f)
+        try:
+            out.append({"name": f, "bytes": os.path.getsize(p),
+                        "mtime": os.path.getmtime(p)})
+        except OSError:
+            pass
+    print(json.dumps({"ok": True, "backups": out}))
+
+
+def cmd_conf_restore(args):
+    name = (args.name or "").strip()
+    if not name or "/" in name or name.startswith("."):
+        raise Refuse("usage: conf-restore <backup-name> (see conf-backups)", 2)
+    p = os.path.join(CONF_BACKUPS, name)
+    if not os.path.exists(p):
+        raise Refuse(f"no such backup: {name}", 2)
+    with open(p) as fh:
+        text = fh.read()
+    # a restore of a previously-good file may legitimately predate the current
+    # guards, so allow it through them but still gate on `squid -k parse`
+    print(json.dumps(apply_squid_conf(text, force=True)))
+
+
+def cmd_repair(args):
+    """Fix PCRE-only url patterns in the STORED policy.
+
+    A policy saved by an older build can contain patterns that the current,
+    stricter validator rejects — which blocks `apply`, `show` and every other
+    command that validates first, with no way forward from the CLI. This
+    rewrites those patterns in place (after a backup) so the stored policy
+    becomes applicable again, and reports exactly what it changed.
+    """
+    raw = load_policy()
+    changed, manual = [], []
+    for tier in ("security_block", "policy_block", "global_allow"):
+        urls = (raw.get(tier) or {}).get("urls")
+        if not isinstance(urls, list):
+            continue
+        for i, u in enumerate(list(urls)):
+            new, notes = repair_pattern(str(u))
+            if new is None:
+                manual.append((tier, u, notes[0]))
+            elif new != u:
+                urls[i] = new
+                changed.append((tier, u, new, "; ".join(notes)))
+    for g in raw.get("groups", []):
+        for key in ("deny_urls", "allow_urls"):
+            urls = g.get(key)
+            if not isinstance(urls, list):
+                continue
+            for i, u in enumerate(list(urls)):
+                new, notes = repair_pattern(str(u))
+                if new is None:
+                    manual.append((f"{g.get('id')}.{key}", u, notes[0]))
+                elif new != u:
+                    urls[i] = new
+                    changed.append((f"{g.get('id')}.{key}", u, new,
+                                    "; ".join(notes)))
+
+    if not changed and not manual:
+        print("stored policy contains no PCRE-only url patterns — nothing "
+              "to repair")
+        return
+    for where, old, new, why in changed:
+        print(f"  [{where}]")
+        print(f"      was : {old}")
+        print(f"      now : {new}")
+        print(f"      why : {why}")
+    for where, pat, why in manual:
+        print(f"  [{where}] NEEDS MANUAL FIX")
+        print(f"      pattern: {pat}")
+        print(f"      reason : {why}")
+    if manual:
+        raise Refuse(f"{len(manual)} pattern(s) cannot be repaired "
+                     f"automatically — nothing was saved", 2)
+
+    if getattr(args, "dry_run", False):
+        print(f"\ndry run — {len(changed)} change(s) shown above, nothing "
+              f"saved. Re-run without --dry-run to apply.")
+        return
+
+    # Confirm the repaired policy actually passes validation before saving,
+    # so a repair can never leave the stored policy in a worse state.
+    validate(raw)
+    if os.path.exists(POLICY):
+        os.makedirs(BACKUPS, exist_ok=True)
+        bak = os.path.join(BACKUPS,
+                           f"policy.json.{time.strftime('%Y%m%d-%H%M%S')}")
+        shutil.copy2(POLICY, bak)
+        print(f"\nbackup: {bak}")
+    save_policy(raw)
+    audit(f"REPAIR {len(changed)} url pattern(s)")
+    print(f"repaired {len(changed)} pattern(s) and saved. The stored policy "
+          f"now validates.\nRun `{sys.argv[0]} apply` to push it to Squid.")
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        description="Per-IP access policy compiler for Squid.")
+    # Passed as ARGUMENTS, not environment variables. sudo refuses
+    # `sudo VAR=x /usr/local/sbin/squid-policy` unless the sudoers rule carries
+    # SETENV: — and adding SETENV: to a rule that runs a Python script would let
+    # the caller set PYTHONPATH and execute their own code as root. Arguments
+    # avoid that entirely.
+    ap.add_argument("--acting-user", metavar="NAME",
+                    help="record this operator in the audit log (the dashboard "
+                         "passes the signed-in user; advisory only, the sudoers "
+                         "grant still decides what may run)")
+    ap.add_argument("--acting-from", metavar="ADDR",
+                    help="record this source address in the audit log")
+    sub = ap.add_subparsers(dest="cmd")
+    ps = sub.add_parser("set", help="read a policy JSON on stdin, validate, apply")
+    ps.add_argument("--dry-run", action="store_true",
+                    help="validate and render only — change nothing")
+    ps.set_defaults(func=cmd_set)
+
+    for name, fn, helptext in (
+            ("init", cmd_init, "create dirs + starter policy, print the include line"),
+            ("get", cmd_get, "print the current policy JSON"),
+            ("apply", cmd_apply, "regenerate and reload from the stored policy"),
+            ("show", cmd_show, "human-readable summary"),
+            ("ready", cmd_ready,
+             "JSON: is the include line AND rules.conf in place? exit 2 if not"),
+            ("rollback", cmd_rollback, "restore the previous generated config"),
+            ("baseline", cmd_baseline, "print the industry-baseline policy"),
+    ):
+        p = sub.add_parser(name, help=helptext)
+        p.set_defaults(func=fn)
+    pr = sub.add_parser("repair",
+                        help="rewrite PCRE-only url patterns in the stored "
+                             "policy to POSIX ERE")
+    pr.add_argument("--dry-run", action="store_true",
+                    help="show what would change without saving")
+    pr.set_defaults(func=cmd_repair)
+
+    for name, fn, helptext in (
+            ("conf-get", cmd_conf_get, "print the live squid.conf as JSON"),
+            ("conf-check", cmd_conf_check,
+             "validate a candidate squid.conf from stdin, change nothing"),
+            ("conf-backups", cmd_conf_backups, "list squid.conf backups"),
+    ):
+        p = sub.add_parser(name, help=helptext)
+        p.set_defaults(func=fn)
+    pcs = sub.add_parser("conf-save",
+                         help="install a new squid.conf from stdin (validate, "
+                              "back up, reload, roll back on failure)")
+    pcs.add_argument("--force", action="store_true",
+                     help="override the safety guards (missing policy include "
+                          "or missing `http_access deny all`)")
+    pcs.set_defaults(func=cmd_conf_save)
+    pcr = sub.add_parser("conf-restore", help="restore a squid.conf backup")
+    pcr.add_argument("name", help="backup file name from conf-backups")
+    pcr.set_defaults(func=cmd_conf_restore)
+
+    pv = sub.add_parser("validate", help="dry run — validate without applying")
+    pv.add_argument("--show-config", action="store_true",
+                    help="also print the config that would be generated")
+    pv.set_defaults(func=cmd_validate)
+
+    args = ap.parse_args()
+    ACTING["user"] = getattr(args, "acting_user", None)
+    ACTING["from"] = getattr(args, "acting_from", None)
+    if not getattr(args, "func", None):
+        ap.print_help()
+        return 2
+    try:
+        self_check()
+        args.func(args)
+    except Refuse as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return e.code
+    except (OSError, ValueError) as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

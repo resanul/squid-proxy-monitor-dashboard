@@ -1,0 +1,127 @@
+{
+  "_comment": "squid-policy database. Edit via the dashboard or `squid-policy set`. Groups are evaluated in the documented order; an IP may belong to exactly one group.",
+  "options": {
+    "drop_connection": false,
+    "deny_raw_ip_urls": true,
+    "deny_executables": false,
+    "note": "baseline"
+  },
+  "global_allow": {
+    "domains": []
+  },
+  "security_block": {
+    "domains": [
+      "anydesk.com",
+      "teamviewer.com",
+      "logmein.com",
+      "rustdesk.com",
+      "ngrok.com",
+      "ngrok.io",
+      "trycloudflare.com",
+      "localtunnel.me",
+      "torproject.org",
+      "nordvpn.com",
+      "expressvpn.com",
+      "protonvpn.com",
+      "surfshark.com",
+      "windscribe.com",
+      "hotspotshield.com",
+      "psiphon3.com",
+      "vpngate.net",
+      "minexmr.com",
+      "nanopool.org",
+      "supportxmr.com",
+      "f2pool.com",
+      "ethermine.org",
+      "2miners.com",
+      "xmrig.com",
+      "duckdns.org",
+      "no-ip.com",
+      "ddns.net",
+      "dynu.com",
+      "hopto.org",
+      "zapto.org",
+      "sytes.net"
+    ],
+    "urls": [
+      "\\.onion/",
+      "^https?://[^/]*\\b(?:malware|botnet|ransomware|keylogger)\\b",
+      "\\bstratum\\+tcp\\b"
+    ]
+  },
+  "policy_block": {
+    "domains": [
+      "dropbox.com",
+      "mega.nz",
+      "mediafire.com",
+      "wetransfer.com",
+      "sendspace.com",
+      "terabox.com",
+      "anonfiles.com",
+      "gofile.io",
+      "pastebin.com",
+      "privnote.com",
+      "justpaste.it",
+      "protonmail.com",
+      "mail.ru",
+      "temp-mail.org",
+      "mailinator.com",
+      "torrentz2.eu",
+      "thepiratebay.org",
+      "1337x.to"
+    ],
+    "urls": [
+      "\\.torrent(\\?|$)"
+    ]
+  },
+  "groups": [
+    {
+      "id": "quarantine",
+      "name": "Quarantined hosts (no internet)",
+      "mode": "deny_all",
+      "enabled": true,
+      "ips": [],
+      "_note": "add a compromised host here for instant internet cut-off"
+    },
+    {
+      "id": "it_admins",
+      "name": "IT / security team (unrestricted)",
+      "mode": "unrestricted",
+      "enabled": true,
+      "ips": [
+        "10.50.0.22",
+        "10.50.0.23"
+      ],
+      "_note": "your two busiest clients \u2014 confirm these really are IT before enabling"
+    },
+    {
+      "id": "kiosk",
+      "name": "Kiosk / ATM hosts (allowlist only)",
+      "mode": "allowlist_only",
+      "enabled": true,
+      "ips": [],
+      "allow_domains": [
+        "cb.example.gov",
+        "centralbank.example.gov"
+      ],
+      "allow_urls": [],
+      "_note": "ATM / kiosk hosts: replace allow_domains with your real list"
+    },
+    {
+      "id": "staff",
+      "name": "General staff (extra restrictions)",
+      "mode": "restricted",
+      "enabled": true,
+      "ips": [],
+      "deny_domains": [
+        "facebook.com",
+        "youtube.com",
+        "tiktok.com",
+        "instagram.com",
+        "netflix.com"
+      ],
+      "deny_urls": [],
+      "_note": "general staff extra blocks; add subnets like 10.60.11.0/24"
+    }
+  ]
+}

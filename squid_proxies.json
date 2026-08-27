@@ -1,0 +1,52 @@
+{
+  "_comment": "Proxies watched by the MONITORING dashboard that runs on the PC. Pass with --proxies-config squid_proxies.json. Each entry appears in the dashboard dropdown, plus an 'All proxies' merged view. Every node here is admin:false on purpose: this instance is for monitoring only and is started WITHOUT --enable-policy / --enable-blocklist, so nothing in this file can change proxy behaviour. Policy enforcement lives in the separate per-proxy admin dashboard that runs on each proxy itself (--local-admin --login-linux).",
+
+  "proxies": [
+    {
+      "id": "p12",
+      "name": "PROD 10.50.0.12",
+      "ssh": "opsuser@10.50.0.12:/var/log/squid/access.log",
+      "squid_host": "10.50.0.12",
+      "admin": false,
+      "enabled": true
+    },
+    {
+      "id": "p13",
+      "name": "PROD 10.50.0.13",
+      "ssh": "opsuser@10.50.0.13:/var/log/squid/access.log",
+      "squid_host": "10.50.0.13",
+      "admin": false,
+      "enabled": true
+    },
+    {
+      "id": "p8",
+      "name": "PROD 10.50.0.8",
+      "ssh": "opsuser@10.50.0.8:/var/log/squid/access.log",
+      "squid_host": "10.50.0.8",
+      "admin": false,
+      "enabled": true
+    },
+    {
+      "id": "p7",
+      "name": "PROD 10.50.0.7",
+      "ssh": "opsuser@10.50.0.7:/var/log/squid/access.log",
+      "squid_host": "10.50.0.7",
+      "admin": false,
+      "enabled": true
+    }
+  ],
+
+  "_fields": {
+    "id": "short stable id used in URLs and alert tags",
+    "name": "label shown in the dropdown",
+    "ssh": "user@host:/path/to/access.log  — or host:2222:/path for a non-standard SSH port",
+    "log": "use instead of ssh for a local or mounted log file",
+    "udp_port": "use instead of ssh to receive access_log udp:// pushes",
+    "tcp_port": "use instead of ssh to receive access_log tcp:// pushes",
+    "squid_host": "host to poll for cache-manager stats (defaults to the ssh host)",
+    "key": "private key file for this proxy (defaults to --ssh-key)",
+    "sudo": "true to run the remote tail via sudo -n (needs NOPASSWD)",
+    "admin": "false = monitor only, the UI cannot change policy/blocklist on it",
+    "enabled": "false to skip this proxy entirely"
+  }
+}

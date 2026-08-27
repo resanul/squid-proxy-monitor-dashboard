@@ -1,0 +1,75 @@
+{
+  "rules": [
+    {
+      "id": "blacklist",
+      "name": "Blacklisted domain accessed",
+      "type": "blacklist",
+      "enabled": true,
+      "severity": "critical",
+      "cooldown": 30,
+      "pattern": "malware|c2|botnet|phish|torrent|\\.onion|crack|keygen|warez"
+    },
+    {
+      "id": "denied-burst",
+      "name": "Denied request burst",
+      "type": "denied_rate",
+      "enabled": true,
+      "severity": "warning",
+      "cooldown": 120,
+      "window": 60,
+      "threshold": 25
+    },
+    {
+      "id": "bw-spike",
+      "name": "Client bandwidth spike",
+      "type": "bandwidth_spike",
+      "enabled": true,
+      "severity": "warning",
+      "cooldown": 180,
+      "window": 60,
+      "threshold_mb": 50.0
+    },
+    {
+      "id": "req-flood",
+      "name": "Client request flood",
+      "type": "client_request_rate",
+      "enabled": true,
+      "severity": "warning",
+      "cooldown": 180,
+      "window": 60,
+      "threshold": 300
+    },
+    {
+      "id": "error-rate",
+      "name": "Upstream error rate high",
+      "type": "error_rate",
+      "enabled": true,
+      "severity": "warning",
+      "cooldown": 120,
+      "window": 60,
+      "threshold": 20
+    },
+    {
+      "id": "slow-pileup",
+      "name": "Slow request pileup",
+      "type": "slow_rate",
+      "enabled": false,
+      "severity": "info",
+      "cooldown": 300,
+      "window": 120,
+      "threshold": 10,
+      "latency_ms": 3000
+    },
+    {
+      "id": "hit-collapse",
+      "name": "Cache hit ratio collapse",
+      "type": "hit_ratio_low",
+      "enabled": false,
+      "severity": "info",
+      "cooldown": 600,
+      "window": 300,
+      "threshold_pct": 20.0,
+      "min_requests": 100
+    }
+  ]
+}

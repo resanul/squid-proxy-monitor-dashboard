@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+*.presanitize.bak
+*.db
+*.db-wal
+*.db-shm
+squid.db*
+history.db*
+*.pem
+dash.env
+token
+squid_alerts_local.json
+squid_proxies_local.json
+.confcheck/

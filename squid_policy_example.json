@@ -1,0 +1,124 @@
+{
+  "_comment": "squid-policy database. Edit via the dashboard or `squid-policy set`. Groups are evaluated in the documented order; an IP may belong to exactly one group.",
+  "options": {
+    "drop_connection": true,
+    "deny_raw_ip_urls": true,
+    "deny_executables": false,
+    "note": "Example Bank downstream proxy (behind F5, upstream Cisco WSA)"
+  },
+  "global_allow": {
+    "domains": []
+  },
+  "security_block": {
+    "domains": [
+      "anydesk.com",
+      "teamviewer.com",
+      "logmein.com",
+      "rustdesk.com",
+      "ngrok.com",
+      "ngrok.io",
+      "trycloudflare.com",
+      "localtunnel.me",
+      "torproject.org",
+      "nordvpn.com",
+      "expressvpn.com",
+      "protonvpn.com",
+      "surfshark.com",
+      "windscribe.com",
+      "hotspotshield.com",
+      "psiphon3.com",
+      "vpngate.net",
+      "minexmr.com",
+      "nanopool.org",
+      "supportxmr.com",
+      "f2pool.com",
+      "ethermine.org",
+      "2miners.com",
+      "xmrig.com",
+      "duckdns.org",
+      "no-ip.com",
+      "ddns.net",
+      "dynu.com",
+      "hopto.org",
+      "zapto.org",
+      "sytes.net"
+    ],
+    "urls": [
+      "\\.onion/",
+      "^https?://[^/]*\\b(?:malware|botnet|ransomware|keylogger)\\b",
+      "\\bstratum\\+tcp\\b"
+    ]
+  },
+  "policy_block": {
+    "domains": [
+      "dropbox.com",
+      "mega.nz",
+      "mediafire.com",
+      "wetransfer.com",
+      "sendspace.com",
+      "terabox.com",
+      "anonfiles.com",
+      "gofile.io",
+      "pastebin.com",
+      "privnote.com",
+      "justpaste.it",
+      "protonmail.com",
+      "mail.ru",
+      "temp-mail.org",
+      "mailinator.com",
+      "torrentz2.eu",
+      "thepiratebay.org",
+      "1337x.to"
+    ],
+    "urls": [
+      "\\.torrent(\\?|$)"
+    ]
+  },
+  "groups": [
+    {
+      "id": "quarantine",
+      "name": "Quarantined hosts (no internet)",
+      "mode": "deny_all",
+      "enabled": true,
+      "ips": [],
+      "_note": "add a compromised host here for an instant internet cut-off; applies to HTTP, HTTPS and (with rules-pre.conf) SSH-over-CONNECT"
+    },
+    {
+      "id": "it_admins",
+      "name": "IT / security team (unrestricted)",
+      "mode": "unrestricted",
+      "enabled": true,
+      "ips": [
+        "10.60.11.222"
+      ],
+      "_note": "Opsuser's IT security host. Bypasses the policy tier, NOT the security tier."
+    },
+    {
+      "id": "kiosk",
+      "name": "Kiosk / ATM hosts (allowlist only)",
+      "mode": "allowlist_only",
+      "enabled": true,
+      "ips": [],
+      "allow_domains": [
+        "cb.example.gov"
+      ],
+      "allow_urls": [],
+      "_note": "allowlist-only hosts. The protected list (payment rails, Windows Update, .examplebank.internal) is added automatically, so adding a PayGate2/PaymentGateway1/NID host here will NOT break those rails."
+    },
+    {
+      "id": "staff",
+      "name": "General staff (extra restrictions)",
+      "mode": "restricted",
+      "enabled": true,
+      "ips": [],
+      "deny_domains": [
+        "facebook.com",
+        "youtube.com",
+        "tiktok.com",
+        "instagram.com"
+      ],
+      "deny_urls": [],
+      "_note": "add staff subnets like 10.60.11.0/24. Keep 10.60.11.222 out of this if it is in it_admins \u2014 an IP may only be in one group."
+    }
+  ]
+}

@@ -1,0 +1,415 @@
+#!/usr/bin/env python3
+"""squid-dash-auth — verify a Linux account for the Squid dashboard.
+
+Why this exists
+---------------
+The dashboard runs as an unprivileged user. Verifying *another* user's password
+needs /etc/shadow, which is root-only, and `unix_chkpwd` invoked as non-root can
+only ever check the calling user's own password — useless for a multi-user login.
+So this small root-owned helper does the check and reports a role, exactly the
+same trust model as squid-policy: root-owned, refuses to run if writable by
+anyone else, invoked through a narrow sudoers NOPASSWD entry.
+
+Authorisation is by Linux group membership, so granting or revoking dashboard
+access is just `usermod -aG` / `gpasswd -d` and nothing else:
+
+    squiddash-admin      full: policy writes AND raw squid.conf editing
+    squiddash-operator   policy/blocklist writes, no raw config editing
+    squiddash-view       read-only
+
+A user in none of those groups is denied even with the right password.
+
+Password handling
+-----------------
+The password arrives as JSON on STDIN only. It is never accepted on the command
+line, because argv is world-readable through ps. It is never written to the
+audit log, never echoed back, and is compared with hmac.compare_digest.
+
+Usage (stdin JSON):
+    echo '{"user":"opsuser","password":"..."}' | squid-dash-auth login
+    squid-dash-auth roles              # show the group -> role mapping
+    squid-dash-auth check <user>       # is this account usable? (no password)
+
+Exit codes: 0 ok · 2 usage/bad input · 6 authentication failed
+            7 authenticated but not authorised · 8 rate-limited
+"""
+import grp
+import hmac
+import json
+import os
+import pwd
+import subprocess
+import sys
+import time
+
+DIR = os.environ.get("SQUID_POLICY_DIR", "/etc/squid/policy")
+ROLES_FILE = os.path.join(DIR, "dash-roles.json")
+AUDIT = os.environ.get("SQUID_DASH_AUDIT", "/var/log/squid-dash-auth.log")
+STATE = os.path.join(DIR, "auth-state.json")
+
+DEFAULT_ROLES = {
+    "admin": ["squiddash-admin"],
+    "operator": ["squiddash-operator"],
+    "viewer": ["squiddash-view"],
+}
+
+# per-user throttle, on top of whatever the dashboard does — the helper is the
+# only component that sees every attempt, including any made by other callers
+MAX_FAILS = 6
+FAIL_WINDOW = 300
+LOCKOUT = 900
+
+NOLOGIN_SHELLS = ("/sbin/nologin", "/usr/sbin/nologin", "/bin/false",
+                  "/usr/bin/false", "/bin/sync", "/sbin/shutdown",
+                  "/sbin/halt")
+
+
+class Fail(Exception):
+    def __init__(self, msg, code=6):
+        super().__init__(msg)
+        self.code = code
+
+
+def audit(msg):
+    """Append one line. Never contains a password."""
+    try:
+        with open(AUDIT, "a") as fh:
+            fh.write(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} {msg}\n")
+    except OSError:
+        pass
+
+
+def self_check():
+    """Refuse to run if this file could have been tampered with.
+
+    A NOPASSWD sudoers entry pointing at a script that a non-root user can
+    edit is a straight path to root, so verify ownership and permissions the
+    same way squid-policy does.
+    """
+    if os.geteuid() != 0:
+        raise Fail("must run as root (via sudo)", 2)
+    me = os.path.realpath(__file__)
+    st = os.stat(me)
+    if st.st_uid != 0:
+        raise Fail(f"refusing to run: {me} is not owned by root", 2)
+    if st.st_mode & 0o022:
+        raise Fail(f"refusing to run: {me} is group/world writable", 2)
+
+
+def load_roles():
+    mapping = {k: list(v) for k, v in DEFAULT_ROLES.items()}
+    try:
+        with open(ROLES_FILE) as fh:
+            data = json.load(fh)
+        for role in ("admin", "operator", "viewer"):
+            key = f"{role}_groups"
+            if isinstance(data.get(key), list):
+                mapping[role] = [str(g) for g in data[key]]
+    except (OSError, ValueError):
+        pass          # defaults are fine, and a broken file must not lock everyone out
+    return mapping
+
+
+# --------------------------------------------------------------------------- #
+#  throttle
+# --------------------------------------------------------------------------- #
+
+def _state():
+    try:
+        with open(STATE) as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return {}
+
+
+def _save_state(st):
+    try:
+        os.makedirs(DIR, exist_ok=True)
+        tmp = STATE + ".tmp"
+        with open(tmp, "w") as fh:
+            json.dump(st, fh)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, STATE)
+    except OSError:
+        pass
+
+
+def throttle_check(user):
+    st = _state()
+    rec = st.get(user) or {}
+    until = rec.get("locked_until", 0)
+    left = int(until - time.time())
+    if left > 0:
+        raise Fail(f"too many failed attempts — locked for {left}s", 8)
+
+
+def throttle_fail(user):
+    now = time.time()
+    st = _state()
+    rec = st.get(user) or {}
+    fails = [t for t in rec.get("fails", []) if now - t < FAIL_WINDOW]
+    fails.append(now)
+    if len(fails) >= MAX_FAILS:
+        st[user] = {"fails": [], "locked_until": now + LOCKOUT}
+        _save_state(st)
+        return True
+    st[user] = {"fails": fails, "locked_until": 0}
+    _save_state(st)
+    return False
+
+
+def throttle_clear(user):
+    st = _state()
+    if user in st:
+        st.pop(user, None)
+        _save_state(st)
+
+
+# --------------------------------------------------------------------------- #
+#  account + password
+# --------------------------------------------------------------------------- #
+
+def account(user):
+    """Return the pwd entry, or raise if the account cannot log in at all."""
+    if not user or len(user) > 64 or "/" in user or "\0" in user:
+        raise Fail("invalid username", 2)
+    try:
+        pw = pwd.getpwnam(user)
+    except KeyError:
+        # same message and timing as a wrong password, so the form cannot be
+        # used to enumerate which accounts exist on the proxy
+        raise Fail("authentication failed")
+    if pw.pw_shell in NOLOGIN_SHELLS:
+        raise Fail("account cannot log in (nologin shell)", 7)
+    if pw.pw_uid == 0:
+        # root has no business signing in to a web UI; use a named admin
+        raise Fail("root is not allowed to sign in to the dashboard", 7)
+    return pw
+
+
+def shadow_entry(user):
+    """Return the /etc/shadow fields for a user, or None."""
+    try:
+        with open("/etc/shadow") as fh:
+            for line in fh:
+                parts = line.rstrip("\n").split(":")
+                if parts and parts[0] == user:
+                    return parts
+    except OSError as e:
+        raise Fail(f"cannot read /etc/shadow: {e}", 2)
+    return None
+
+
+def _num(parts, idx):
+    try:
+        v = parts[idx]
+    except IndexError:
+        return None
+    return int(v) if v.strip().lstrip("-").isdigit() else None
+
+
+def check_aging(parts):
+    """Honour the shadow expiry fields.
+
+    An account that HR has expired, or whose password has aged out, must not
+    get in — otherwise a leaver whose Linux account was expired (rather than
+    deleted) would keep dashboard access, and password rotation policy would
+    quietly not apply to this login path. Fields are per shadow(5):
+      2 lastchg · 4 max · 6 inactive · 7 expire   (all in days since epoch)
+    """
+    today = int(time.time() // 86400)
+    lastchg, mx = _num(parts, 2), _num(parts, 4)
+    inactive, expire = _num(parts, 6), _num(parts, 7)
+
+    if expire is not None and expire >= 0 and today >= expire:
+        raise Fail("this account has expired — contact an administrator", 7)
+    if lastchg == 0:
+        # forced change at next login; there is no way to change it here
+        raise Fail("password must be changed before signing in — log in over "
+                   "SSH once to set a new password", 7)
+    if lastchg is not None and mx is not None and 0 < mx < 99999:
+        aged = lastchg + mx
+        if today > aged:
+            grace = inactive if (inactive is not None and inactive >= 0) else 0
+            if today > aged + grace:
+                raise Fail("password has expired — log in over SSH to set a "
+                           "new one", 7)
+            raise Fail("password has expired (within the grace period) — set "
+                       "a new one over SSH", 7)
+
+
+def verify_password(user, password):
+    """True when the password is correct. Tries crypt, falls back to unix_chkpwd."""
+    parts = shadow_entry(user)
+    if parts is None:
+        raise Fail("authentication failed")
+    h = parts[1] if len(parts) > 1 else ""
+    if h in ("", "*", "!") or h.startswith("!") or h.startswith("*"):
+        # locked or password-less account — never let it in
+        raise Fail("account is locked or has no password", 7)
+    check_aging(parts)
+
+    try:
+        import crypt                       # removed in Python 3.13
+    except ImportError:
+        crypt = None
+    if crypt is not None:
+        try:
+            calc = crypt.crypt(password, h)
+        except OSError:
+            calc = None
+        if calc:
+            return hmac.compare_digest(calc, h)
+
+    # Fallback for Pythons without crypt: pam_unix's own helper. Running as
+    # root it may verify any account, which is exactly why this helper is the
+    # thing holding root and not the dashboard.
+    for path in ("/usr/sbin/unix_chkpwd", "/sbin/unix_chkpwd"):
+        if os.path.exists(path):
+            try:
+                p = subprocess.run([path, user, "nullok"],
+                                   input=(password + "\0").encode(),
+                                   capture_output=True, timeout=10)
+                return p.returncode == 0
+            except (OSError, subprocess.SubprocessError):
+                break
+    raise Fail("no password verification method available on this host "
+               "(python crypt missing and unix_chkpwd not found)", 2)
+
+
+def groups_of(pw):
+    names = set()
+    try:
+        names.add(grp.getgrgid(pw.pw_gid).gr_name)
+    except KeyError:
+        pass
+    for g in grp.getgrall():
+        if pw.pw_name in g.gr_mem:
+            names.add(g.gr_name)
+    return sorted(names)
+
+
+def role_for(groups, mapping):
+    """Highest role the user's groups grant, or None."""
+    gs = set(groups)
+    for role in ("admin", "operator", "viewer"):      # most privileged first
+        if gs & set(mapping.get(role, [])):
+            return role
+    return None
+
+
+# --------------------------------------------------------------------------- #
+#  commands
+# --------------------------------------------------------------------------- #
+
+def read_stdin_json():
+    raw = sys.stdin.read()
+    if not raw.strip():
+        raise Fail("expected JSON on stdin", 2)
+    try:
+        data = json.loads(raw)
+    except ValueError as e:
+        raise Fail(f"invalid JSON on stdin: {e}", 2)
+    if not isinstance(data, dict):
+        raise Fail("stdin JSON must be an object", 2)
+    return data
+
+
+def cmd_login(_argv):
+    data = read_stdin_json()
+    user = str(data.get("user") or "").strip()
+    password = data.get("password")
+    if not isinstance(password, str) or not password:
+        raise Fail("password missing", 2)
+    from_ip = str(data.get("from") or "-")[:64]
+
+    throttle_check(user)
+    mapping = load_roles()
+    try:
+        pw = account(user)
+        if not verify_password(user, password):
+            raise Fail("authentication failed")
+    except Fail as e:
+        locked = throttle_fail(user) if e.code == 6 else False
+        audit(f"LOGIN FAIL user={user} from={from_ip} reason={e}"
+              f"{' LOCKED' if locked else ''}")
+        time.sleep(0.5)                    # blunt the guessing rate
+        raise
+
+    groups = groups_of(pw)
+    role = role_for(groups, mapping)
+    if not role:
+        audit(f"LOGIN DENIED user={user} from={from_ip} "
+              f"reason=no dashboard group")
+        raise Fail("password accepted, but this account is in none of the "
+                   "dashboard groups — ask an admin to add you to "
+                   + ", ".join(sorted(sum(mapping.values(), []))), 7)
+
+    throttle_clear(user)
+    audit(f"LOGIN OK user={user} from={from_ip} role={role}")
+    print(json.dumps({"ok": True, "user": user, "role": role,
+                      "uid": pw.pw_uid, "gecos": pw.pw_gecos,
+                      "groups": groups}))
+
+
+def cmd_check(argv):
+    """Is this account usable, and what role would it get? No password needed."""
+    if not argv:
+        raise Fail("usage: check <user>", 2)
+    user = argv[0]
+    mapping = load_roles()
+    pw = account(user)
+    groups = groups_of(pw)
+    role = role_for(groups, mapping)
+    print(json.dumps({"ok": bool(role), "user": user, "role": role,
+                      "groups": groups}))
+    if not role:
+        sys.exit(7)
+
+
+def cmd_roles(_argv):
+    mapping = load_roles()
+    src = ROLES_FILE if os.path.exists(ROLES_FILE) else "(built-in defaults)"
+    print(f"role mapping from: {src}\n")
+    for role in ("admin", "operator", "viewer"):
+        gs = mapping.get(role, [])
+        print(f"  {role:<9} <- {', '.join(gs) or '(none)'}")
+        for g in gs:
+            try:
+                members = sorted(grp.getgrnam(g).gr_mem)
+                print(f"      {g}: {', '.join(members) or '(no members)'}")
+            except KeyError:
+                print(f"      {g}: !! group does not exist on this host")
+    print("\nwhat each role may do:")
+    print("  admin     traffic view + policy/blocklist writes + squid.conf editing")
+    print("  operator  traffic view + policy/blocklist writes")
+    print("  viewer    traffic view only")
+
+
+COMMANDS = {"login": cmd_login, "check": cmd_check, "roles": cmd_roles}
+
+
+def main():
+    argv = sys.argv[1:]
+    if not argv or argv[0] in ("-h", "--help"):
+        print(__doc__)
+        return 2
+    cmd = COMMANDS.get(argv[0])
+    if not cmd:
+        print(f"unknown command {argv[0]!r}; try: {', '.join(COMMANDS)}",
+              file=sys.stderr)
+        return 2
+    try:
+        self_check()
+        cmd(argv[1:])
+    except Fail as e:
+        print(json.dumps({"ok": False, "error": str(e)}), file=sys.stderr)
+        return e.code
+    except (OSError, ValueError) as e:
+        print(json.dumps({"ok": False, "error": str(e)}), file=sys.stderr)
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
