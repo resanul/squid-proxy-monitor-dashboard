@@ -1,36 +1,20 @@
 {
-  "_comment": "Proxies watched by the MONITORING dashboard that runs on the PC. Pass with --proxies-config squid_proxies.json. Each entry appears in the dashboard dropdown, plus an 'All proxies' merged view. Every node here is admin:false on purpose: this instance is for monitoring only and is started WITHOUT --enable-policy / --enable-blocklist, so nothing in this file can change proxy behaviour. Policy enforcement lives in the separate per-proxy admin dashboard that runs on each proxy itself (--local-admin --login-linux).",
+  "_comment": "This is a TEMPLATE, not a working config — the IPs below are documentation-only placeholders (RFC 5737 TEST-NET ranges, guaranteed never to be real). Do not point --proxies-config at this file as-is. Instead run ./configure-proxies.sh, which asks for your real proxies and tests SSH to each one before writing a working file with this same shape.",
 
   "proxies": [
     {
-      "id": "p12",
-      "name": "PROD 10.50.0.12",
-      "ssh": "opsuser@10.50.0.12:/var/log/squid/access.log",
-      "squid_host": "10.50.0.12",
+      "id": "example1",
+      "name": "Example Proxy 1",
+      "ssh": "youruser@192.0.2.11:/var/log/squid/access.log",
+      "squid_host": "192.0.2.11",
       "admin": false,
       "enabled": true
     },
     {
-      "id": "p13",
-      "name": "PROD 10.50.0.13",
-      "ssh": "opsuser@10.50.0.13:/var/log/squid/access.log",
-      "squid_host": "10.50.0.13",
-      "admin": false,
-      "enabled": true
-    },
-    {
-      "id": "p8",
-      "name": "PROD 10.50.0.8",
-      "ssh": "opsuser@10.50.0.8:/var/log/squid/access.log",
-      "squid_host": "10.50.0.8",
-      "admin": false,
-      "enabled": true
-    },
-    {
-      "id": "p7",
-      "name": "PROD 10.50.0.7",
-      "ssh": "opsuser@10.50.0.7:/var/log/squid/access.log",
-      "squid_host": "10.50.0.7",
+      "id": "example2",
+      "name": "Example Proxy 2",
+      "ssh": "youruser@192.0.2.12:/var/log/squid/access.log",
+      "squid_host": "192.0.2.12",
       "admin": false,
       "enabled": true
     }

@@ -85,29 +85,28 @@ install -m 0755 "$SRC/squid_dashboard.py" "$APP_DIR/squid_dashboard.py"
 install -o root -g root -m 0755 "$SRC/squid-dash-auth" /usr/local/sbin/squid-dash-auth
 install -m 0755 "$SRC/squid-policy" "$APP_DIR/squid-policy"   # pushed to proxies
 [ -f "$SRC/setup-proxy.sh" ] && install -m 0755 "$SRC/setup-proxy.sh" "$APP_DIR/setup-proxy.sh"
+[ -f "$SRC/configure-proxies.sh" ] && install -m 0755 "$SRC/configure-proxies.sh" "$APP_DIR/configure-proxies.sh"
 echo "   installed into $APP_DIR"
 
 say "4. proxy list"
+NEEDS_CONFIGURE=0
 if [ -f "$CONF_DIR/proxies.json" ]; then
   echo "   keeping the existing $CONF_DIR/proxies.json"
 else
-  if [ -f "$SRC/squid_proxies.json" ]; then
-    install -m 0644 "$SRC/squid_proxies.json" "$CONF_DIR/proxies.json"
-    echo "   copied from squid_proxies.json"
-  else
-    cat > "$CONF_DIR/proxies.json" <<'JSON'
+  # Deliberately NOT shipping a starter file with example IPs here. An earlier
+  # version wrote four fake-but-real-looking "PROD 10.x.x.x" entries, which is
+  # exactly the kind of thing a new user mistakes for their own already-done
+  # configuration instead of an example to replace — the dashboard then shows
+  # a fleet that does not exist. configure-proxies.sh asks for the real
+  # proxies instead and tests SSH to each one immediately.
+  cat > "$CONF_DIR/proxies.json" <<'JSON'
 {
-  "_comment": "Proxies managed from this host. admin:false = monitor only.",
-  "proxies": [
-    {"id":"p12","name":"PROD 10.50.0.12","ssh":"opsuser@10.50.0.12:/var/log/squid/access.log","squid_host":"10.50.0.12","admin":false,"enabled":true},
-    {"id":"p13","name":"PROD 10.50.0.13","ssh":"opsuser@10.50.0.13:/var/log/squid/access.log","squid_host":"10.50.0.13","admin":false,"enabled":true},
-    {"id":"p8","name":"PROD 10.50.0.8","ssh":"opsuser@10.50.0.8:/var/log/squid/access.log","squid_host":"10.50.0.8","admin":false,"enabled":true},
-    {"id":"p7","name":"PROD 10.50.0.7","ssh":"opsuser@10.50.0.7:/var/log/squid/access.log","squid_host":"10.50.0.7","admin":false,"enabled":true}
-  ]
+  "_comment": "Empty on purpose. Run configure-proxies.sh to add your real proxies — it asks for each one's IP/hostname and tests SSH connectivity immediately, rather than you hand-editing this file.",
+  "proxies": []
 }
 JSON
-    echo "   wrote a starter $CONF_DIR/proxies.json (all monitor-only)"
-  fi
+  echo "   wrote an EMPTY $CONF_DIR/proxies.json — no fleet yet"
+  NEEDS_CONFIGURE=1
 fi
 chmod 0644 "$CONF_DIR/proxies.json"
 
@@ -251,23 +250,35 @@ cat <<DONE
 
   NEXT, in order:
 
-  1. give yourself a role (this is what login checks):
+  1. tell it which proxies to watch (asks for each IP, tests SSH right away):
+       $APP_DIR/configure-proxies.sh
+
+  2. give yourself a role (this is what login checks):
        sudo usermod -aG squiddash-admin <your-linux-user>
      read-only users:
        sudo usermod -aG squiddash-view <username>
 
-  2. install the key printed in step 5 on each proxy, then prepare them:
-       $APP_DIR/setup-proxy.sh 10.50.0.12
+  3. install the key printed in step 5 above on each proxy, then prepare them:
+       $APP_DIR/setup-proxy.sh <proxy-ip>
      ...repeat per proxy. This installs the helper, sudoers, log ACL and the
      include line. It does not change how Squid handles traffic.
 
-  3. start it:
+  4. start it:
        sudo systemctl enable --now squid-monitor
        sudo systemctl status squid-monitor --no-pager
        sudo journalctl -u squid-monitor -f
 
-  Policy writes stay OFF for every proxy until you set "admin": true for it in
-  $CONF_DIR/proxies.json and restart. Enable one proxy first, confirm it, then
-  the rest.
+  Policy writes stay OFF for every proxy until you set "admin": true for it —
+  re-run configure-proxies.sh, or edit $CONF_DIR/proxies.json, then restart.
+  Enable one proxy first, confirm it, then the rest.
 ============================================================
 DONE
+
+if [ "$NEEDS_CONFIGURE" = 1 ] && [ -t 0 ] && [ -t 1 ]; then
+  echo
+  read -r -p "Run the proxy configuration wizard now? [Y/n]: " RUN_WIZ
+  case "${RUN_WIZ:-y}" in
+    [Nn]*) echo "Skipped — run $APP_DIR/configure-proxies.sh whenever you're ready." ;;
+    *) [ -x "$APP_DIR/configure-proxies.sh" ] && "$APP_DIR/configure-proxies.sh" ;;
+  esac
+fi

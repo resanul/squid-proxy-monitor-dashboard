@@ -74,15 +74,25 @@ the UI, alert rules, and drill-down before pointing it at anything real.
 
 ## Point it at a real proxy
 
+For more than one proxy, don't hand-edit a config file — run the wizard. It asks
+how many proxies you have, their IP/hostname and SSH details, and **tests SSH
+connectivity to each one immediately**, so a typo or a missing key is caught right
+there instead of showing up later as a dashboard with nothing in it:
+
+```bash
+./configure-proxies.sh
+# -> writes squid_proxies.json, ready to use:
+python3 squid_dashboard.py --proxies-config squid_proxies.json
+```
+
+For a single proxy, the flags work directly too:
+
 ```bash
 # over SSH — no software installed on the proxy for monitoring
 python3 squid_dashboard.py --ssh youruser@proxy-host:/var/log/squid/access.log
 
 # a log file that's already local or mounted
 python3 squid_dashboard.py --log /var/log/squid/access.log
-
-# several proxies at once, with a dropdown + merged "all proxies" view
-python3 squid_dashboard.py --proxies-config squid_proxies.json
 ```
 
 See [`docs/dashboard-guide.md`](docs/dashboard-guide.md) for every flag (alerts,
@@ -97,9 +107,16 @@ sudo ./install.sh
 ```
 
 This sets up `/opt/squid-monitor`, a dedicated service account with its own SSH
-key, TLS certificate, the `squiddash-*` Linux groups, and a systemd unit —
-monitoring-only until you opt individual proxies into policy writes. Then, once per
-proxy you want to manage:
+key, TLS certificate, the `squiddash-*` Linux groups, and a systemd unit — starting
+with an intentionally *empty* fleet, not example IPs that look like real ones. The
+installer offers to run the configuration wizard right away; if you skip that, run
+it yourself before starting the service:
+
+```bash
+/opt/squid-monitor/configure-proxies.sh
+```
+
+Then, once per proxy you want to manage (not just monitor):
 
 ```bash
 /opt/squid-monitor/setup-proxy.sh <proxy-ip>
@@ -123,8 +140,9 @@ Full walkthrough, including the reasoning behind each step and a Bengali version
 | `squid-dash-auth` | Root-owned helper for `--login-linux`: verifies a Linux account's password and reports its role from group membership. |
 | `squid-blocklist` | Simpler standalone domain/IP/URL blocklist helper, independent of the per-IP policy engine. |
 | `install.sh` | Installs the dashboard as a systemd service on a management host. |
+| `configure-proxies.sh` | Interactive wizard: asks for your proxies' IPs and tests SSH to each one, then writes `proxies.json`. The recommended way to configure the fleet — run it before starting the service. |
 | `setup-proxy.sh` | Prepares one proxy to be managed from that host. Idempotent — safe to re-run. |
-| `squid_proxies.json` | Example multi-proxy config for `--proxies-config`. |
+| `squid_proxies.json` | Example multi-proxy config shape for `--proxies-config` — for reference; `configure-proxies.sh` generates a working one for you. |
 | `squid_policy_baseline.json`, `squid_policy_example.json` | Example policy documents — an industry-baseline starting point and a worked example with real groups. |
 | `squid_alerts.json`, `squid_alerts_bank.json` | Default and a heavier-traffic example alert ruleset. |
 | `test_policy_sim.py`, `test_userconf_sim.py`, `test_bank_regex.py` | Test suites that simulate Squid's own ACL evaluation to catch policy-generation bugs before they reach a real proxy. |
