@@ -44,7 +44,7 @@ Reading the log may need group access on the proxy:
     sudo usermod -a -G squid <user>      # or use --ssh-sudo
 """
 
-__version__ = "1.11.0"       # …1.7 policy editor · 1.8 monitor-only · 1.8.1 panel
+__version__ = "1.12.0"       # …1.7 policy editor · 1.8 monitor-only · 1.8.1 panel
                               # feedback fixes · 1.9 client-history panel
                               # (unique/connected clients over selectable time
                               # ranges, backed by the already-unbounded hourly
@@ -54,7 +54,11 @@ __version__ = "1.11.0"       # …1.7 policy editor · 1.8 monitor-only · 1.8.1
                               # proxy, via /proc + df — no helper installed ·
                               # 1.11 Live feed moved to its own tab (no more
                               # page-length table crowding the overview), plus
-                              # a dark/light theme toggle (persisted, no FOUC)
+                              # a dark/light theme toggle (persisted, no FOUC) ·
+                              # 1.12 Denied/Slowest retain up to 1000 rows
+                              # server-side (was 120); live SSE ticks still
+                              # carry only ~40 for bandwidth, with a
+                              # "load up to 1000" button for the full history
 
 import argparse
 import collections
@@ -88,7 +92,15 @@ DEFAULT_LOG_PATHS = [
     "C:/Squid/var/log/squid/access.log",
 ]
 
-MAX_RECENT = 400          # rows kept for the live request table
+MAX_RECENT = 1000         # rows kept for the live request table
+MINI_RETAIN = 1000        # denied/slow rows RETAINED server-side (deque size)
+MINI_LIVE_N = 40          # denied/slow rows pushed on every ~2s live tick —
+                          # kept small on purpose: pushing all MINI_RETAIN rows
+                          # on every tick to every connected browser would cost
+                          # real bandwidth for data that rarely changes between
+                          # ticks. The full up-to-MINI_RETAIN list is available
+                          # on demand via /api/mini (see the panel's own
+                          # "load full history" button).
 TOP_N = 12                # size of "top talkers" style leaderboards
 RATE_WINDOW = 120         # seconds of per-second history for the charts
 SLOW_MS = 2000            # requests slower than this are flagged
@@ -248,8 +260,8 @@ class Stats:
         self.users = collections.Counter()
         self.client_bytes = collections.Counter()
         self.host_bytes = collections.Counter()
-        self.denied = collections.deque(maxlen=120)
-        self.slow = collections.deque(maxlen=120)
+        self.denied = collections.deque(maxlen=MINI_RETAIN)
+        self.slow = collections.deque(maxlen=MINI_RETAIN)
         self.recent = collections.deque(maxlen=MAX_RECENT)
         # per-entity drill-down: client IP -> detail, destination host -> detail.
         # Bounded (see DETAIL_ENTITIES) so a long run can't grow without limit.
@@ -546,13 +558,23 @@ class Stats:
                 "top_users": [
                     {"key": k, "n": v} for k, v in self.users.most_common(TOP_N)
                 ],
-                "denied": list(self.denied)[:25],
-                "slow": list(self.slow)[:25],
+                "denied": list(self.denied)[:MINI_LIVE_N],
+                "slow": list(self.slow)[:MINI_LIVE_N],
                 "recent": list(self.recent)[:recent_limit],
                 "cache_mgr": self.cache_mgr,
             }
         out["proxy"] = self.pid
         return out
+
+    def mini(self, kind, limit=MINI_RETAIN):
+        """The FULL retained denied/slow list (up to MINI_RETAIN), on demand.
+
+        Separate from snapshot() so browsing deep history doesn't cost every
+        live SSE tick — see MINI_LIVE_N.
+        """
+        with self.lock:
+            src = self.denied if kind == "denied" else self.slow
+            return list(src)[:max(1, min(int(limit), MINI_RETAIN))]
 
 
 # --------------------------------------------------------------------------- #
@@ -3185,8 +3207,8 @@ def snapshot_all(recent_limit=120):
         "top_clients": merge_top("top_clients"),
         "top_hosts": merge_top("top_hosts"),
         "top_users": merge_top("top_users"),
-        "denied": merge_rows("denied", 25),
-        "slow": merge_rows("slow", 25),
+        "denied": merge_rows("denied", MINI_LIVE_N),
+        "slow": merge_rows("slow", MINI_LIVE_N),
         "recent": merge_rows("recent", recent_limit),
         "cache_mgr": {"available": False,
                       "note": "select a single proxy for cache manager stats"},
@@ -3878,6 +3900,28 @@ class Handler(BaseHTTPRequestHandler):
                 "proxies": [host_row(c.id, c.name, c.sysinfo)
                            for c in PROXIES.values()],
             })
+        elif route == "/api/mini":
+            # the FULL retained Denied/Slowest history (up to MINI_RETAIN),
+            # fetched on demand — the live SSE ticks only carry MINI_LIVE_N
+            # rows each, to keep the continuous push cheap (see MINI_LIVE_N)
+            kind = q.get("kind", [""])[0]
+            pid = q.get("proxy", [""])[0]
+            limit = int(q.get("limit", [str(MINI_RETAIN)])[0])
+            if kind not in ("denied", "slow"):
+                self._json({"error": "need kind=denied|slow"}, 400)
+            elif pid == "all":
+                rows = []
+                for c in PROXIES.values():
+                    rows += [dict(r, p=c.id) for r in c.stats.mini(kind, limit)]
+                rows.sort(key=lambda r: r.get("ts", 0), reverse=True)
+                self._json({"rows": rows[:limit], "retained": MINI_RETAIN})
+            else:
+                ctx = get_ctx(pid or None)
+                if not ctx:
+                    self._json({"rows": [], "retained": MINI_RETAIN})
+                else:
+                    self._json({"rows": ctx.stats.mini(kind, limit),
+                               "retained": MINI_RETAIN})
         elif route == "/api/config":
             pid = q.get("proxy", [""])[0]
             pa = get_policy_admin(None if pid in ("", "all") else pid)
@@ -4664,10 +4708,12 @@ tr.arow:hover .evcue{color:var(--accent,#3b82f6);border-color:var(--accent,#3b82
 </div>
 
 <div class="grid g2">
-  <div class="card"><h2>Denied / blocked <span class="tag">policy violations</span></h2>
+  <div class="card"><h2>Denied / blocked <span class="tag" id="deny_tag">policy violations</span>
+    <button id="deny_full" style="margin-left:10px" title="load the full retained history (up to 1000)">⤓ load up to 1000</button></h2>
     <div class="scroll" style="max-height:290px"><table><thead><tr><th>time</th><th>client</th><th>st</th><th>host</th><th>url</th></tr></thead>
     <tbody id="deny_t"></tbody></table></div><div class="empty" id="deny_e">none — clean</div></div>
-  <div class="card"><h2>Slowest requests <span class="tag">&gt; 2000 ms</span></h2>
+  <div class="card"><h2>Slowest requests <span class="tag" id="slow_tag">&gt; 2000 ms</span>
+    <button id="slow_full" style="margin-left:10px" title="load the full retained history (up to 1000)">⤓ load up to 1000</button></h2>
     <div class="scroll" style="max-height:290px"><table><thead><tr><th>time</th><th>ms</th><th>client</th><th>host</th><th>url</th></tr></thead>
     <tbody id="slow_t"></tbody></table></div><div class="empty" id="slow_e">none — all fast</div></div>
 </div>
@@ -4855,7 +4901,8 @@ const sclass=s=>'s'+String(s).charAt(0);
 
 /* ------------------------------------------------------------------ state */
 let paused=false, rows=[], methodsSeen=new Set(), lastStats=null;
-const MAXROWS=500;
+let deniedFull=null, slowFull=null;   // frozen full history once "load up to 1000" is used
+const MAXROWS=1000;
 /* multi-proxy: '' = default (first proxy), 'all' = merged view */
 let selProxy=sessionStorage.getItem('proxy')||'', proxyList=[], proxyName={};
 const isAll=()=>selProxy==='all';
@@ -4995,6 +5042,38 @@ $('sys_refresh').onclick=loadSysInfo;
 setInterval(loadSysInfo, 20000);
 loadSysInfo();
 
+/* --------------------------------------------------- denied/slow full history */
+/* Live ticks only carry the newest ~40 rows (MINI_LIVE_N) to keep the SSE
+   push cheap. "load up to 1000" fetches the full server-retained history on
+   demand and freezes the panel on it until toggled back to live. */
+async function loadMiniFull(kind){
+  const p=isAll()?'all':curProxy();
+  try{
+    const d=await (await fetch(`/api/mini?kind=${kind}&proxy=${encodeURIComponent(p)}`)).json();
+    return d.rows||[];
+  }catch(e){ return null; }
+}
+function wireMiniFull(btnId,tagId,getFull,setFull,liveLabel){
+  $(btnId).onclick=async()=>{
+    if(getFull()){
+      setFull(null);
+      $(btnId).textContent='⤓ load up to 1000';
+      $(tagId).textContent=liveLabel;
+      if(lastStats) renderStats(lastStats);
+      return;
+    }
+    $(btnId).textContent='loading…';
+    const rows=await loadMiniFull(btnId==='deny_full'?'denied':'slow');
+    if(rows===null){ $(btnId).textContent='⤓ load up to 1000'; return; }
+    setFull(rows);
+    $(btnId).textContent='↺ back to live';
+    $(tagId).textContent=`showing ${fmtN(rows.length)} of up to 1000 retained`;
+    if(lastStats) renderStats(lastStats);
+  };
+}
+wireMiniFull('deny_full','deny_tag',()=>deniedFull,v=>deniedFull=v,'policy violations');
+wireMiniFull('slow_full','slow_tag',()=>slowFull,v=>slowFull=v,'> 2000 ms');
+
 /* ------------------------------------------------------------------ render */
 function renderStats(s){
   lastStats=s;
@@ -5063,10 +5142,10 @@ function renderStats(s){
   if(al.history&&!alertHist.length&&al.history.length){
     al.history.slice().reverse().forEach(a=>onAlert(a,false));
   }
-  drawMini('deny_t','deny_e',s.denied,r=>
+  drawMini('deny_t','deny_e',deniedFull||s.denied,r=>
     `<td class="dimc">${hhmmss(r.ts)}</td><td>${esc(r.client)}</td><td class="${sclass(r.status)}">${r.status}</td>
      <td>${esc(r.host)}</td><td class="dimc" title="${esc(r.url)}">${esc(r.url)}</td>`);
-  drawMini('slow_t','slow_e',s.slow,r=>
+  drawMini('slow_t','slow_e',slowFull||s.slow,r=>
     `<td class="dimc">${hhmmss(r.ts)}</td><td class="slowc">${fmtN(r.elapsed)}</td><td>${esc(r.client)}</td>
      <td>${esc(r.host)}</td><td class="dimc" title="${esc(r.url)}">${esc(r.url)}</td>`);
 }
@@ -5737,6 +5816,9 @@ function switchProxy(pid){
   sessionStorage.setItem('proxy',selProxy);
   $('proxy_sel').value=selProxy;
   rows=[]; $('feed').innerHTML=''; lastStats=null;
+  // a frozen full denied/slow list belongs to the proxy it was loaded for
+  if(deniedFull){deniedFull=null;$('deny_full').textContent='⤓ load up to 1000';$('deny_tag').textContent='policy violations'}
+  if(slowFull){slowFull=null;$('slow_full').textContent='⤓ load up to 1000';$('slow_tag').textContent='> 2000 ms'}
   document.querySelectorAll('.pcol').forEach(el=>el.style.display=isAll()?'':'none');
   drawStrip(); refreshNow(); loadClients();
 }

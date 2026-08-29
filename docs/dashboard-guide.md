@@ -148,6 +148,18 @@ Disable with `--no-sysinfo`, or slow the SSH polling down with
 `--sysinfo-interval 60` on a fleet where the extra per-interval SSH command
 matters. The underlying endpoint is `GET /api/sysinfo`.
 
+### Denied/blocked and Slowest requests — up to 1000 retained
+
+Both panels keep up to **1000** rows server-side per proxy (was 120). The
+continuous live update (every ~2s over SSE) still only carries the newest
+~40 of those, on purpose — pushing all 1000 rows on every tick to every
+connected browser would cost real, ongoing bandwidth for data that mostly
+doesn't change between ticks. Click **"load up to 1000"** on either panel to
+pull the full retained history on demand (`GET /api/mini?kind=denied|slow`);
+click it again to go back to the live 40-row view. Switching proxies resets
+back to live automatically, since a frozen list belongs to whichever proxy
+it was loaded for.
+
 ## Policy and blocklist admin
 
 These let the dashboard write to a proxy, through the root-owned
