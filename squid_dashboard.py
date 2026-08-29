@@ -44,14 +44,17 @@ Reading the log may need group access on the proxy:
     sudo usermod -a -G squid <user>      # or use --ssh-sudo
 """
 
-__version__ = "1.10.0"       # …1.7 policy editor · 1.8 monitor-only · 1.8.1 panel
+__version__ = "1.11.0"       # …1.7 policy editor · 1.8 monitor-only · 1.8.1 panel
                               # feedback fixes · 1.9 client-history panel
                               # (unique/connected clients over selectable time
                               # ranges, backed by the already-unbounded hourly
                               # rollup table so it survives restarts) · 1.10
                               # System health panel: CPU/memory/disk/network
                               # for the dashboard's own host and each SSH
-                              # proxy, via /proc + df — no helper installed
+                              # proxy, via /proc + df — no helper installed ·
+                              # 1.11 Live feed moved to its own tab (no more
+                              # page-length table crowding the overview), plus
+                              # a dark/light theme toggle (persisted, no FOUC)
 
 import argparse
 import collections
@@ -4209,6 +4212,7 @@ class Handler(BaseHTTPRequestHandler):
 
 INDEX_HTML = r"""<!DOCTYPE html>
 <html lang="en"><head>
+<script>try{document.documentElement.dataset.theme=localStorage.getItem('sqm_theme')||'dark'}catch(e){}</script>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Squid Proxy · Live Monitor</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -4220,13 +4224,24 @@ INDEX_HTML = r"""<!DOCTYPE html>
   --hit:#2dd4a7; --miss:#4a9eff; --deny:#ff4d6d; --err:#ffa726;
   --accent:#4a9eff;
   --mono:'JetBrains Mono',ui-monospace,Menlo,monospace;
+  color-scheme:dark;
+}
+html[data-theme="light"]{
+  --bg:#f4f6fa; --panel:#ffffff; --panel2:#eef1f6; --line:#dde3ec;
+  --txt:#1a2233; --dim:#5b6b82; --faint:#8b98ac;
+  --hit:#0f9d76; --miss:#2b7fd6; --deny:#d63754; --err:#c9780a;
+  --accent:#2b7fd6;
+  color-scheme:light;
 }
 *{box-sizing:border-box}
 body{margin:0;background:var(--bg);color:var(--txt);font-family:Inter,system-ui,sans-serif;
-  font-size:13px;-webkit-font-smoothing:antialiased}
+  font-size:13px;-webkit-font-smoothing:antialiased;transition:background .2s,color .2s}
 body::before{content:'';position:fixed;inset:0;pointer-events:none;z-index:0;
   background:radial-gradient(1100px 500px at 12% -12%,rgba(74,158,255,.10),transparent 60%),
              radial-gradient(900px 480px at 92% 0%,rgba(45,212,167,.07),transparent 62%)}
+html[data-theme="light"] body::before{
+  background:radial-gradient(1100px 500px at 12% -12%,rgba(43,127,214,.06),transparent 60%),
+             radial-gradient(900px 480px at 92% 0%,rgba(15,157,118,.05),transparent 62%)}
 .wrap{position:relative;z-index:1;max-width:1680px;margin:0 auto;padding:18px 22px 40px}
 
 /* ---------- header ---------- */
@@ -4248,6 +4263,15 @@ button,.btn{font:inherit;font-size:11.5px;padding:6px 12px;border-radius:7px;cur
   transition:.15s}
 button:hover,.btn:hover{color:var(--txt);border-color:var(--accent)}
 button.act{color:var(--bg);background:var(--accent);border-color:var(--accent);font-weight:600}
+
+/* ---------- view tabs ---------- */
+.tabs{display:flex;gap:6px;margin-bottom:16px;border-bottom:1px solid var(--line);padding-bottom:0}
+.tabbtn{font:inherit;font-size:12.5px;font-weight:600;padding:9px 16px;border:0;background:none;
+  color:var(--dim);cursor:pointer;border-bottom:2px solid transparent;margin-bottom:-1px;
+  transition:.15s}
+.tabbtn:hover{color:var(--txt)}
+.tabbtn.act{color:var(--accent);border-bottom-color:var(--accent)}
+.tabbtn .tag{font-family:var(--mono);font-weight:400}
 
 /* ---------- kpi ---------- */
 .kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(158px,1fr));gap:11px;margin-bottom:16px}
@@ -4523,6 +4547,7 @@ tr.arow:hover .evcue{color:var(--accent,#3b82f6);border-color:var(--accent,#3b82
   <span class="pill"><i class="dot" id="dot"></i><span id="conn">connecting…</span></span>
   <span class="pill" id="logpill">log: —</span>
   <span class="pill" id="clock">--:--:--</span>
+  <button id="theme_btn" title="Switch between dark and light theme">🌙 Dark</button>
   <button id="notif" title="Enable desktop notifications">🔔 Notify: off</button>
   <button id="sound" title="Alert sound">🔈 Sound: off</button>
   <button id="rules_btn" class="bell">⚙ Alert rules<span class="badge" id="badge">0</span></button>
@@ -4538,6 +4563,12 @@ tr.arow:hover .evcue{color:var(--accent,#3b82f6);border-color:var(--accent,#3b82
 <div id="pstrip"></div>
 <div id="toasts"></div>
 
+<nav class="tabs" id="view_tabs">
+  <button class="tabbtn act" data-view="overview">Overview</button>
+  <button class="tabbtn" data-view="live">Live feed<span class="tag" id="tab_feed_n" style="margin-left:6px"></span></button>
+</nav>
+
+<div id="view_overview">
 <div class="kpis">
   <div class="kpi"><div class="lbl">Requests</div><div class="val" id="k_req">0</div><div class="sub" id="k_req_s">total seen</div></div>
   <div class="kpi b"><div class="lbl">Req / sec</div><div class="val" id="k_rps">0</div><div class="sub">5s rolling avg</div></div>
@@ -4579,7 +4610,9 @@ tr.arow:hover .evcue{color:var(--accent,#3b82f6);border-color:var(--accent,#3b82
   <div class="card"><h2>Methods &amp; proxy info</h2><div class="body"><div class="bars" id="meth_bars"></div>
     <dl class="kv" id="mgr" style="margin-top:14px;padding-top:12px;border-top:1px solid var(--line)"></dl></div></div>
 </div>
+</div><!-- /view_overview (part 1 — live feed sits on its own tab) -->
 
+<div id="view_live" style="display:none">
 <div class="card">
   <h2>Live request stream <span class="tag" id="feed_tag">0 rows</span></h2>
   <div class="filters">
@@ -4589,14 +4622,16 @@ tr.arow:hover .evcue{color:var(--accent,#3b82f6);border-color:var(--accent,#3b82
     <select id="f_meth"><option value="">all methods</option></select>
     <button id="clear">clear</button>
   </div>
-  <div class="scroll"><table><thead><tr>
+  <div class="scroll" style="max-height:calc(100vh - 260px)"><table><thead><tr>
     <th>time</th><th class="pcol">proxy</th><th>client</th><th>user</th><th>m</th>
     <th>st</th><th>outcome</th><th>action</th><th>bytes</th><th>ms</th>
     <th>host</th><th>url</th>
   </tr></thead><tbody id="feed"></tbody></table></div>
   <div class="empty" id="feed_empty">waiting for traffic…</div>
 </div>
+</div><!-- /view_live -->
 
+<div id="view_overview2">
 <div class="card" id="clients_card">
   <h2>Client history <span class="tag" id="cli_range_tag">last 24h</span>
     <button id="cli_refresh" style="margin-left:10px">refresh</button></h2>
@@ -4685,6 +4720,7 @@ tr.arow:hover .evcue{color:var(--accent,#3b82f6);border-color:var(--accent,#3b82
     </div>
   </div>
 </div>
+</div><!-- /view_overview (part 2) -->
 
 <footer>Squid Proxy Monitor · stdlib Python + SSE · reading <span id="foot_log">—</span></footer>
 
@@ -5065,6 +5101,7 @@ function drawFeed(){
   $('feed').innerHTML=vis.slice(0,MAXROWS).map(r=>rowHtml(r,false)).join('');
   $('feed_tag').textContent=vis.length+' rows'+(rows.length!==vis.length?' / '+rows.length:'');
   $('feed_empty').style.display=vis.length?'none':'block';
+  $('tab_feed_n').textContent=vis.length?fmtN(vis.length):'';
 }
 function pushRow(r){
   rows.unshift(r); if(rows.length>MAXROWS+120) rows.length=MAXROWS+120;
@@ -5073,6 +5110,7 @@ function pushRow(r){
   while(tb.rows.length>MAXROWS) tb.deleteRow(tb.rows.length-1);
   $('feed_empty').style.display='none';
   $('feed_tag').textContent=tb.rows.length+' rows';
+  $('tab_feed_n').textContent=fmtN(tb.rows.length);
 }
 
 /* ------------------------------------------------------------------ alerts */
@@ -5850,6 +5888,39 @@ function connect(){
     es.close();setTimeout(connect,retry);retry=Math.min(retry*1.7,12000)};
 }
 connect();
+
+/* -------------------------------------------------------------- view tabs */
+/* "Live feed" is kept on its own tab instead of on the main overview page —
+   it's a dense, fast-scrolling table that crowds the KPIs/charts above it.
+   Tabs (not a real page navigation) so the SSE connection and all polling
+   keep running underneath regardless of which tab is visible — switching
+   tabs never drops or re-fetches data, it only shows/hides existing DOM. */
+function showView(name){
+  const live=name==='live';
+  $('view_overview').style.display=live?'none':'';
+  $('view_overview2').style.display=live?'none':'';
+  $('view_live').style.display=live?'':'none';
+  document.querySelectorAll('.tabbtn').forEach(b=>
+    b.classList.toggle('act', b.dataset.view===name));
+  if(location.hash.replace('#','')!==name){
+    history.replaceState(null,'',name==='live'?'#live':'#');
+  }
+}
+document.querySelectorAll('.tabbtn').forEach(b=>
+  b.onclick=()=>showView(b.dataset.view));
+window.addEventListener('hashchange',()=>
+  showView(location.hash==='#live'?'live':'overview'));
+showView(location.hash==='#live'?'live':'overview');
+
+/* -------------------------------------------------------------------- theme */
+function applyTheme(t){
+  document.documentElement.dataset.theme=t;
+  try{localStorage.setItem('sqm_theme',t)}catch(e){}
+  $('theme_btn').textContent=t==='light'?'🌙 Dark':'☀️ Light';
+}
+$('theme_btn').onclick=()=>applyTheme(
+  document.documentElement.dataset.theme==='light'?'dark':'light');
+applyTheme(document.documentElement.dataset.theme==='light'?'light':'dark');
 
 /* ------------------------------------------------------------------ ui */
 $('proxy_sel').onchange=()=>switchProxy($('proxy_sel').value);

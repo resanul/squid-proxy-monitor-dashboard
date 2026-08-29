@@ -4,6 +4,22 @@
 complete flag reference; for the guided install path see
 [`setup-guide.md`](setup-guide.md).
 
+## Two tabs, one theme toggle
+
+The UI is split into two tabs, switched instantly (no page reload, no lost SSE
+connection or polling state):
+
+- **Overview** — KPIs, traffic rate, System health, Client history, top
+  clients/destinations, denied/slow requests, alert log, blocklist admin.
+- **Live feed** — just the raw request table, given the full page height
+  instead of competing for space with everything above it. Bookmarkable as
+  `#live` in the URL.
+
+The 🌙/☀️ button in the header switches between dark and light. The choice is
+remembered (`localStorage`) and re-applied before the page paints, so
+reloading never flashes the wrong theme. This only covers the main dashboard
+— the sign-in page is dark-only.
+
 ```
 python3 squid_dashboard.py --help
 ```
