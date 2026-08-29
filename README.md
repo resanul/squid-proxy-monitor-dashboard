@@ -42,6 +42,11 @@ proxies themselves:
   client seen and how many are unique, over 1 hour up to 3 months (or a custom
   range), backed by the same hourly rollups — so it isn't reset by restarting
   the service and isn't limited by the raw-request disk budget.
+- **System health, not just traffic** — CPU, memory, disk, and network for the
+  dashboard's own host and for every SSH-connected proxy, so a machine quietly
+  filling its disk or maxing its CPU shows up even while its traffic numbers
+  look normal. Read-only `/proc` + `df` over the same SSH access already used
+  to tail logs — nothing new installed on the proxy.
 
 ## Architecture
 

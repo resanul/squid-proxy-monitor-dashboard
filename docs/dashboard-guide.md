@@ -27,6 +27,8 @@ document mirrors it with added explanation.
 | `--demo-rate N` | `6` | Demo requests per second. |
 | `--alerts-config FILE` | `./squid_alerts.json` | Alert rule definitions. |
 | `--no-alerts` | off | Disable the alert engine. |
+| `--no-sysinfo` | off | Disable the **System health** panel (CPU/memory/disk/network). |
+| `--sysinfo-interval SECS` | `20` | How often to sample resource usage. For each SSH proxy this is one extra short-lived SSH command per interval. |
 
 ## Remote proxy over SSH (run this on your own PC or a management host)
 
@@ -103,6 +105,32 @@ The underlying endpoint is `GET /api/clients?range=7d` (or `since=<epoch>`
 and optionally `until=<epoch>` for a custom window, plus `proxy=<id>` to
 scope to one proxy) — useful if you want to pull the same numbers from a
 script instead of the UI.
+
+### System health panel
+
+A separate concern from Squid traffic: **is the machine itself healthy**. A
+proxy can look perfectly fine in the traffic view while its disk fills up or
+it starts swapping — this panel catches that. Shown for:
+
+- **the dashboard's own host** — read directly from `/proc`, no network
+  round-trip.
+- **every SSH-sourced proxy** — one short-lived read-only SSH command per
+  polling interval (`/proc/stat`, `/proc/meminfo`, `df -kP /`,
+  `/proc/loadavg`, `/proc/uptime`, `/proc/net/dev`). Nothing is installed on
+  the proxy and nothing needs root — the same unprivileged account already
+  used to tail `access.log` can read all of these.
+- Sources with no real host to probe (`--demo`, `--udp-port`, `--tcp-port`)
+  show "no SSH system probe for this source" instead of a fabricated number.
+
+Each host card shows CPU/memory/disk as ring gauges (turning amber at ≥75%,
+red at ≥90%), plus load average, uptime, and network throughput (measured
+directly — not a synthetic "network health %", since a made-up score would
+be less useful than the real send/receive rate and the SSH probe's own
+round-trip latency, both of which are shown as-is).
+
+Disable with `--no-sysinfo`, or slow the SSH polling down with
+`--sysinfo-interval 60` on a fleet where the extra per-interval SSH command
+matters. The underlying endpoint is `GET /api/sysinfo`.
 
 ## Policy and blocklist admin
 

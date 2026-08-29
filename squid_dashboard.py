@@ -44,11 +44,14 @@ Reading the log may need group access on the proxy:
     sudo usermod -a -G squid <user>      # or use --ssh-sudo
 """
 
-__version__ = "1.9.0"        # …1.7 policy editor · 1.8 monitor-only · 1.8.1 panel
+__version__ = "1.10.0"       # …1.7 policy editor · 1.8 monitor-only · 1.8.1 panel
                               # feedback fixes · 1.9 client-history panel
                               # (unique/connected clients over selectable time
                               # ranges, backed by the already-unbounded hourly
-                              # rollup table so it survives restarts)
+                              # rollup table so it survives restarts) · 1.10
+                              # System health panel: CPU/memory/disk/network
+                              # for the dashboard's own host and each SSH
+                              # proxy, via /proc + df — no helper installed
 
 import argparse
 import collections
@@ -1002,6 +1005,241 @@ class Store:
 STORE = None               # a Store when --db is used
 
 
+# --------------------------------------------------------------------------- #
+#  System health — CPU / memory / disk / network for the dashboard's own
+#  host and for each SSH-reachable proxy. Separate from Squid traffic stats:
+#  this is "is the machine itself healthy", which traffic counters can't show
+#  (a proxy can look fine in the traffic view while swapping itself to death).
+# --------------------------------------------------------------------------- #
+
+def _read_proc_stat_cpu(text):
+    """The first 'cpu ' line of /proc/stat -> 8-tuple of jiffie counters."""
+    for line in text.splitlines():
+        if line.startswith("cpu "):
+            parts = [int(x) for x in line.split()[1:9]]
+            parts += [0] * (8 - len(parts))
+            return tuple(parts[:8])
+    return None
+
+
+def _cpu_pct_from_deltas(prev, cur):
+    """% busy between two /proc/stat samples. None until there are two."""
+    if not prev or not cur:
+        return None
+    total_d = sum(cur) - sum(prev)
+    if total_d <= 0:
+        return None
+    idle_d = (cur[3] + cur[4]) - (prev[3] + prev[4])   # idle + iowait
+    return max(0.0, min(100.0, (total_d - idle_d) / total_d * 100))
+
+
+def _read_meminfo(text):
+    info = {}
+    for line in text.splitlines():
+        if ":" not in line:
+            continue
+        k, _, v = line.partition(":")
+        try:
+            info[k.strip()] = int(v.strip().split()[0]) * 1024   # kB -> bytes
+        except (ValueError, IndexError):
+            pass
+    total = info.get("MemTotal", 0)
+    avail = info.get("MemAvailable", info.get("MemFree", 0))
+    used = max(0, total - avail)
+    return {"total": total, "used": used,
+            "pct": (used / total * 100) if total else None}
+
+
+def _read_net_dev(text):
+    """Sum rx/tx bytes across every interface except loopback."""
+    rx = tx = 0
+    for line in text.splitlines():
+        if ":" not in line:
+            continue
+        iface, _, rest = line.partition(":")
+        if iface.strip() in ("", "lo"):
+            continue
+        f = rest.split()
+        if len(f) >= 9:
+            try:
+                rx += int(f[0]); tx += int(f[8])
+            except ValueError:
+                pass
+    return rx, tx
+
+
+def _parse_sys_blob(text):
+    """Split the '---SECTION---' delimited output of the remote probe command."""
+    sections, cur, buf = {}, None, []
+    for line in text.splitlines():
+        if line.startswith("---") and line.endswith("---") and len(line) > 6:
+            if cur is not None:
+                sections[cur] = "\n".join(buf)
+            cur, buf = line.strip("-"), []
+        else:
+            buf.append(line)
+    if cur is not None:
+        sections[cur] = "\n".join(buf)
+    return sections
+
+
+SYS_PROBE_CMD = (
+    "echo ---CPU---; cat /proc/stat 2>/dev/null | head -1; "
+    "echo ---MEM---; cat /proc/meminfo 2>/dev/null; "
+    "echo ---DISK---; df -kP / 2>/dev/null | tail -1; "
+    "echo ---LOAD---; cat /proc/loadavg 2>/dev/null; "
+    "echo ---UPTIME---; cat /proc/uptime 2>/dev/null; "
+    "echo ---NET---; cat /proc/net/dev 2>/dev/null"
+)
+
+
+class SysCollector(threading.Thread):
+    """Polls CPU/memory/disk/network for one host, on a background thread.
+
+    mode="local"  reads /proc directly — the machine this dashboard process
+                  runs on (the management host, or a proxy when the
+                  dashboard runs there itself).
+    mode="ssh"    runs ONE read-only command over SSH per interval: /proc and
+                  df, all readable by an unprivileged account. This is the
+                  same trust boundary already used to tail access.log — no
+                  helper, no sudo, nothing installed on the proxy.
+    """
+
+    def __init__(self, pid, name, mode="local", host=None, user=None, port=22,
+                 key=None, ssh_bin="ssh", interval=20):
+        super().__init__(daemon=True, name=f"sysinfo-{pid}")
+        self.pid, self.name, self.mode = pid, name, mode
+        self.host, self.user, self.port, self.key = host, user, port, key
+        self.ssh_bin, self.interval = ssh_bin, max(5, interval)
+        self.stop_flag = threading.Event()
+        self.lock = threading.Lock()
+        self._prev_cpu = None
+        self._prev_net = None            # (rx, tx, ts)
+        self.latest = {"ok": False, "kind": mode, "error": "not polled yet",
+                       "ts": None}
+
+    def snapshot(self):
+        with self.lock:
+            return dict(self.latest)
+
+    def stop(self):
+        self.stop_flag.set()
+
+    def run(self):
+        self._poll_once()
+        while not self.stop_flag.wait(self.interval):
+            self._poll_once()
+
+    def _poll_once(self):
+        t0 = time.time()
+        try:
+            raw = self._collect_local() if self.mode == "local" \
+                  else self._collect_ssh()
+        except Exception as e:                     # a bad host must not kill
+            raw = {"ok": False, "error": str(e)[:200]}       # this thread
+        raw["kind"] = self.mode
+        raw["latency_ms"] = round((time.time() - t0) * 1000)
+        raw["ts"] = time.time()
+        raw.setdefault("ok", True)
+        with self.lock:
+            self.latest = raw
+
+    def _net_delta(self, rx, tx, now):
+        net_rx_bps = net_tx_bps = None
+        if self._prev_net:
+            prx, ptx, pts = self._prev_net
+            dt = max(0.001, now - pts)
+            if rx >= prx and tx >= ptx:
+                net_rx_bps = (rx - prx) / dt
+                net_tx_bps = (tx - ptx) / dt
+        self._prev_net = (rx, tx, now)
+        return net_rx_bps, net_tx_bps
+
+    def _collect_local(self):
+        try:
+            with open("/proc/stat") as fh:
+                cpu_now = _read_proc_stat_cpu(fh.read())
+        except OSError:
+            cpu_now = None
+        cpu_pct = _cpu_pct_from_deltas(self._prev_cpu, cpu_now)
+        self._prev_cpu = cpu_now
+        try:
+            with open("/proc/meminfo") as fh:
+                mem = _read_meminfo(fh.read())
+        except OSError:
+            mem = {"total": 0, "used": 0, "pct": None}
+        try:
+            du = shutil.disk_usage("/")
+            disk = {"total": du.total, "used": du.used,
+                    "pct": (du.used / du.total * 100) if du.total else None}
+        except OSError:
+            disk = {"total": 0, "used": 0, "pct": None}
+        try:
+            load = list(os.getloadavg())
+        except (OSError, AttributeError):
+            load = None
+        try:
+            with open("/proc/uptime") as fh:
+                uptime = float(fh.read().split()[0])
+        except (OSError, ValueError, IndexError):
+            uptime = None
+        rx = tx = None
+        try:
+            with open("/proc/net/dev") as fh:
+                rx, tx = _read_net_dev(fh.read())
+        except OSError:
+            pass
+        net_rx_bps = net_tx_bps = None
+        if rx is not None:
+            net_rx_bps, net_tx_bps = self._net_delta(rx, tx, time.time())
+        return {"ok": True, "cpu_pct": cpu_pct, "mem": mem, "disk": disk,
+                "load": load, "uptime": uptime,
+                "net_rx_bps": net_rx_bps, "net_tx_bps": net_tx_bps}
+
+    def _collect_ssh(self):
+        cmd = [self.ssh_bin, "-o", "BatchMode=yes", "-o", "ConnectTimeout=8",
+               "-o", "StrictHostKeyChecking=accept-new"]
+        if self.key:
+            cmd += ["-i", os.path.expanduser(self.key)]
+        if self.port:
+            cmd += ["-p", str(self.port)]
+        cmd += [f"{self.user}@{self.host}" if self.user else self.host,
+                SYS_PROBE_CMD]
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=12)
+        if p.returncode != 0:
+            return {"ok": False,
+                    "error": (p.stderr or "ssh probe failed").strip()[:200]}
+        sec = _parse_sys_blob(p.stdout)
+        cpu_now = _read_proc_stat_cpu(sec.get("CPU") or "")
+        cpu_pct = _cpu_pct_from_deltas(self._prev_cpu, cpu_now)
+        self._prev_cpu = cpu_now
+        mem = _read_meminfo(sec.get("MEM") or "")
+        disk = {"total": 0, "used": 0, "pct": None}
+        disk_lines = (sec.get("DISK") or "").strip().splitlines()
+        if disk_lines:
+            f = disk_lines[-1].split()      # df -kP: fs 1024blks used avail cap% mnt
+            if len(f) >= 3:
+                try:
+                    total_kb, used_kb = int(f[1]), int(f[2])
+                    disk = {"total": total_kb * 1024, "used": used_kb * 1024,
+                            "pct": (used_kb / total_kb * 100) if total_kb
+                                   else None}
+                except ValueError:
+                    pass
+        load_f = (sec.get("LOAD") or "").split()
+        load = [float(x) for x in load_f[:3]] if len(load_f) >= 3 else None
+        up_f = (sec.get("UPTIME") or "").split()
+        uptime = float(up_f[0]) if up_f else None
+        rx, tx = _read_net_dev(sec.get("NET") or "")
+        net_rx_bps, net_tx_bps = self._net_delta(rx, tx, time.time())
+        return {"ok": True, "cpu_pct": cpu_pct, "mem": mem, "disk": disk,
+                "load": load, "uptime": uptime,
+                "net_rx_bps": net_rx_bps, "net_tx_bps": net_tx_bps}
+
+
+LOCAL_SYS = None            # a SysCollector for the dashboard's own host
+
+
 class ProxyCtx:
     """Everything belonging to one monitored proxy: its own counters, its own
     alert engine (so windowed rules never mix traffic from two proxies), and
@@ -1013,6 +1251,7 @@ class ProxyCtx:
         self.cfg = cfg or {}
         self.stats = Stats(pid)
         self.alerts = None          # AlertEngine, attached in main()
+        self.sysinfo = None         # SysCollector, attached in main() for SSH proxies
         self.threads = []
 
     def stop(self):
@@ -3619,6 +3858,23 @@ class Handler(BaseHTTPRequestHandler):
                 res["since"] = since
                 res["until"] = until
                 self._json(res)
+        elif route == "/api/sysinfo":
+            def host_row(pid, name, coll):
+                if coll is None:
+                    return {"id": pid, "name": name, "available": False}
+                snap = coll.snapshot()
+                snap["id"] = pid
+                snap["name"] = name
+                snap["available"] = True
+                return snap
+            self._json({
+                "enabled": not (LOCAL_SYS is None
+                                and all(c.sysinfo is None
+                                        for c in PROXIES.values())),
+                "host": host_row("_local", "dashboard host", LOCAL_SYS),
+                "proxies": [host_row(c.id, c.name, c.sysinfo)
+                           for c in PROXIES.values()],
+            })
         elif route == "/api/config":
             pid = q.get("proxy", [""])[0]
             pa = get_policy_admin(None if pid in ("", "all") else pid)
@@ -4036,6 +4292,26 @@ button.act{color:var(--bg);background:var(--accent);border-color:var(--accent);f
   transition:width .5s cubic-bezier(.2,.8,.2,1)}
 .bar.warn .fill{background:linear-gradient(90deg,var(--deny),#ff8a5b)}
 
+/* ---------- system health ---------- */
+.syshost{background:var(--panel2);border:1px solid var(--line);border-radius:10px;
+  padding:14px;min-width:280px;flex:1 1 280px}
+.syshost .hname{font-family:var(--mono);font-size:12px;font-weight:700;color:var(--txt);
+  display:flex;align-items:center;gap:7px;margin-bottom:10px}
+.syshost .hname .dot{width:7px;height:7px;border-radius:50%;flex-shrink:0}
+.syshost .dot.on{background:var(--hit)} .syshost .dot.off{background:var(--deny)}
+.gauges{display:flex;gap:12px;justify-content:space-between}
+.gauge{display:flex;flex-direction:column;align-items:center;gap:2px}
+.gauge svg{display:block}
+.gauge .gv{font-family:var(--mono);font-size:13px;font-weight:700;fill:var(--txt)}
+.gauge .gl{font-family:var(--mono);font-size:8.5px;letter-spacing:.08em;color:var(--faint);
+  text-transform:uppercase;margin-top:2px}
+.sysmeta{margin-top:12px;padding-top:10px;border-top:1px solid var(--line);
+  font-family:var(--mono);font-size:10.5px;color:var(--dim);display:grid;
+  grid-template-columns:1fr 1fr;gap:4px 10px}
+.sysmeta .k{color:var(--faint)}
+.syshost.err{border-color:var(--deny)}
+.syshost .errmsg{font-family:var(--mono);font-size:11px;color:var(--deny);margin-top:6px}
+
 /* ---------- tables ---------- */
 .scroll{max-height:430px;overflow:auto}
 .scroll::-webkit-scrollbar{width:8px;height:8px}
@@ -4271,6 +4547,13 @@ tr.arow:hover .evcue{color:var(--accent,#3b82f6);border-color:var(--accent,#3b82
   <div class="kpi r"><div class="lbl">Denied</div><div class="val" id="k_den">0</div><div class="sub">policy blocks</div></div>
   <div class="kpi"><div class="lbl">Clients</div><div class="val" id="k_cli">0</div><div class="sub" id="k_cli_s">unique IPs</div></div>
   <div class="kpi"><div class="lbl">Uptime</div><div class="val" id="k_up">0s</div><div class="sub" id="k_up_s">monitoring</div></div>
+</div>
+
+<div class="card" id="sys_card">
+  <h2>System health <span class="tag" id="sys_tag">CPU · memory · disk · network</span>
+    <button id="sys_refresh" style="margin-left:10px">refresh</button></h2>
+  <div class="body" id="sys_body" style="display:flex;gap:14px;flex-wrap:wrap;padding:16px"></div>
+  <div class="empty" id="sys_empty" style="display:none"></div>
 </div>
 
 <div class="grid g3">
@@ -4602,6 +4885,79 @@ function bars(el,items,opt={}){
   if(dk) el.querySelectorAll('.bar.clik').forEach(b=>
     b.onclick=()=>openDetail(b.dataset.dk,b.dataset.dv));
 }
+
+/* ------------------------------------------------------------- system health */
+function gaugeColor(pct){
+  if(pct==null)return '#3a4658';
+  return pct>=90?'#ff4d6d':pct>=75?'#ffa726':'#2dd4a7';
+}
+function gaugeSVG(pct,label){
+  const r=26,sw=6,cx=32,cy=32,C=2*Math.PI*r;
+  const has=pct!=null&&!isNaN(pct);
+  const frac=has?Math.max(0,Math.min(100,pct))/100:0;
+  const col=gaugeColor(has?pct:null);
+  const txt=has?Math.round(pct)+'%':'—';
+  return `<div class="gauge"><svg width="64" height="64" viewBox="0 0 64 64">
+    <circle cx="${cx}" cy="${cy}" r="${r}" fill="none" stroke="#1f2a3a" stroke-width="${sw}"/>
+    <circle cx="${cx}" cy="${cy}" r="${r}" fill="none" stroke="${col}" stroke-width="${sw}"
+      stroke-linecap="round" stroke-dasharray="${(C*frac).toFixed(1)} ${C.toFixed(1)}"
+      transform="rotate(-90 ${cx} ${cy})"/>
+    <text x="${cx}" y="${cy+4}" text-anchor="middle" class="gv">${txt}</text>
+  </svg><div class="gl">${esc(label)}</div></div>`;
+}
+function fmtBps(n){ return n==null?'—':fmtB(n)+'/s' }
+function fmtUptime(s){ return s==null?'—':fmtT(s) }
+function sysHostCard(h){
+  const nm=h.name||h.id;
+  if(h.available===false){
+    return `<div class="syshost"><div class="hname"><i class="dot off"></i>${esc(nm)}</div>
+      <div class="dimc" style="font-size:11px">no SSH system probe for this source
+      (demo/UDP/TCP feeds have no host to poll)</div></div>`;
+  }
+  if(!h.ok){
+    return `<div class="syshost err"><div class="hname"><i class="dot off"></i>${esc(nm)}</div>
+      <div class="errmsg">${esc(h.error||'probe failed')}</div></div>`;
+  }
+  const mem=h.mem||{}, disk=h.disk||{};
+  const load=(h.load||[]).map(x=>x.toFixed(2)).join(' / ')||'—';
+  const age=h.ts?Math.max(0,Math.round(Date.now()/1000-h.ts)):null;
+  return `<div class="syshost"><div class="hname"><i class="dot on"></i>${esc(nm)}
+      <span class="dimc" style="font-weight:400;margin-left:auto;font-size:10px">${h.kind==='ssh'?'via SSH':'this host'}</span></div>
+    <div class="gauges">
+      ${gaugeSVG(h.cpu_pct,'CPU')}
+      ${gaugeSVG(mem.pct,'Memory')}
+      ${gaugeSVG(disk.pct,'Disk')}
+    </div>
+    <div class="sysmeta">
+      <div><span class="k">mem</span> ${fmtB(mem.used)} / ${fmtB(mem.total)}</div>
+      <div><span class="k">disk</span> ${fmtB(disk.used)} / ${fmtB(disk.total)}</div>
+      <div><span class="k">load</span> ${load}</div>
+      <div><span class="k">uptime</span> ${fmtUptime(h.uptime)}</div>
+      <div><span class="k">net ↓/↑</span> ${fmtBps(h.net_rx_bps)} / ${fmtBps(h.net_tx_bps)}</div>
+      <div><span class="k">checked</span> ${age==null?'—':age+'s ago'} (${h.latency_ms??'—'}ms)</div>
+    </div></div>`;
+}
+async function loadSysInfo(){
+  try{
+    const d=await (await fetch('/api/sysinfo')).json();
+    if(!d.enabled){
+      $('sys_body').innerHTML='';
+      $('sys_empty').style.display='block';
+      $('sys_empty').textContent='system health is disabled (started with --no-sysinfo)';
+      return;
+    }
+    $('sys_empty').style.display='none';
+    const cards=[sysHostCard(d.host)]
+      .concat((d.proxies||[]).map(sysHostCard));
+    $('sys_body').innerHTML=cards.join('');
+  }catch(e){
+    $('sys_empty').style.display='block';
+    $('sys_empty').textContent='could not load system health';
+  }
+}
+$('sys_refresh').onclick=loadSysInfo;
+setInterval(loadSysInfo, 20000);
+loadSysInfo();
 
 /* ------------------------------------------------------------------ render */
 function renderStats(s){
@@ -5877,6 +6233,14 @@ def main():
     ap.add_argument("--alerts-config", default="squid_alerts.json",
                     help="JSON file storing alert rules (default ./squid_alerts.json)")
     ap.add_argument("--no-alerts", action="store_true", help="disable the alert engine")
+    ap.add_argument("--no-sysinfo", action="store_true",
+                    help="disable the System health panel (CPU/memory/disk/"
+                         "network for this host and each SSH proxy)")
+    ap.add_argument("--sysinfo-interval", type=int, default=20, metavar="SECS",
+                    help="how often to sample system resources, in seconds "
+                         "(default 20). For SSH proxies this is one extra "
+                         "short-lived SSH command per interval, reading only "
+                         "/proc and df — nothing is installed on the proxy.")
 
     b = ap.add_argument_group("blocklist admin (writes ACL lists on the proxy)")
     b.add_argument("--enable-blocklist", action="store_true",
@@ -6025,6 +6389,22 @@ def main():
             cm = CacheMgr(ctx, squid_host, args.squid_port, enabled=True,
                           password=args.squid_pass)
             cm.start(); ctx.threads.append(cm); threads.append(cm)
+
+        # system health (CPU/mem/disk/net) — only meaningful for SSH proxies;
+        # a demo/udp/tcp source has no host we could safely probe
+        if not args.no_sysinfo and sp["kind"] == "ssh":
+            si = SysCollector(ctx.id, ctx.name, mode="ssh", host=sp["host"],
+                              user=sp["user"], port=sp["port"], key=sp["key"],
+                              ssh_bin=args.ssh_bin,
+                              interval=args.sysinfo_interval)
+            si.start(); ctx.threads.append(si); threads.append(si)
+            ctx.sysinfo = si
+
+    if not args.no_sysinfo:
+        globals()["LOCAL_SYS"] = SysCollector(
+            "_local", "dashboard host", mode="local",
+            interval=args.sysinfo_interval)
+        LOCAL_SYS.start(); threads.append(LOCAL_SYS)
 
     if not args.no_alerts:
         ar = AlertRunner(); ar.start(); threads.append(ar)
