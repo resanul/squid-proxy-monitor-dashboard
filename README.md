@@ -38,6 +38,10 @@ proxies themselves:
   detail up to a size you choose (oldest data pruned first) plus permanent hourly
   rollups, so alerts can show you the actual requests that triggered them, not just
   a count.
+- **Client history that survives restarts** — a dedicated panel lists every
+  client seen and how many are unique, over 1 hour up to 3 months (or a custom
+  range), backed by the same hourly rollups — so it isn't reset by restarting
+  the service and isn't limited by the raw-request disk budget.
 
 ## Architecture
 

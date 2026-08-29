@@ -44,7 +44,11 @@ Reading the log may need group access on the proxy:
     sudo usermod -a -G squid <user>      # or use --ssh-sudo
 """
 
-__version__ = "1.8.1"        # …1.7 policy editor · 1.8 monitor-only · 1.8.1 panel feedback fixes
+__version__ = "1.9.0"        # …1.7 policy editor · 1.8 monitor-only · 1.8.1 panel
+                              # feedback fixes · 1.9 client-history panel
+                              # (unique/connected clients over selectable time
+                              # ranges, backed by the already-unbounded hourly
+                              # rollup table so it survives restarts)
 
 import argparse
 import collections
@@ -916,6 +920,60 @@ class Store:
         except sqlite3.Error as e:
             self.last_error = f"trend failed: {e}"
             return []
+
+    def clients(self, since, until=None, proxy=None, limit=1000):
+        """Every client seen in [since, until), aggregated from rollup_hour.
+
+        rollup_hour is never pruned by the disk budget (unlike the raw
+        requests table), so this answers "who connected in the last N days"
+        even months after the raw request detail for that period has aged
+        out — and it survives a dashboard/service restart because it lives
+        in the same SQLite file, not in memory.
+
+        `since`/`until` are epoch seconds; hour buckets are truncated to the
+        hour so a window edge can include a *little* more than asked for
+        (at most 59 minutes), never less.
+        """
+        since_h = int(since // 3600) * 3600
+        sql = ["SELECT client, SUM(reqs), SUM(bytes), SUM(denied), "
+               "SUM(errors), MIN(hour), MAX(hour), COUNT(DISTINCT host) "
+               "FROM rollup_hour WHERE hour >= ?"]
+        args = [since_h]
+        if until:
+            sql.append("AND hour < ?")
+            args.append(int(until // 3600) * 3600 + 3600)
+        if proxy not in (None, "", "all"):
+            sql.append("AND proxy = ?")
+            args.append(proxy)
+        # the true unique count must not depend on the display LIMIT below,
+        # otherwise capping the list at e.g. 1000 rows for the UI would also
+        # (silently, wrongly) cap the reported "unique clients" total
+        count_sql = ["SELECT COUNT(DISTINCT client), SUM(reqs) "
+                     "FROM rollup_hour WHERE hour >= ?"]
+        count_args = [since_h]
+        if until:
+            count_sql.append("AND hour < ?")
+            count_args.append(int(until // 3600) * 3600 + 3600)
+        if proxy not in (None, "", "all"):
+            count_sql.append("AND proxy = ?")
+            count_args.append(proxy)
+        sql.append("GROUP BY client ORDER BY SUM(reqs) DESC LIMIT ?")
+        args.append(max(1, min(int(limit), 20000)))
+        try:
+            unique, total_reqs = self.db.execute(
+                " ".join(count_sql), count_args).fetchone()
+            rows = self.db.execute(" ".join(sql), args).fetchall()
+            clients = [{"client": c or "-", "requests": r, "bytes": b,
+                        "denied": d, "errors": e, "first_seen": fh,
+                        "last_seen": lh + 3600, "hosts": h}
+                       for c, r, b, d, e, fh, lh, h in rows]
+            return {"clients": clients, "unique": unique or 0,
+                    "total_requests": total_reqs or 0,
+                    "truncated": (unique or 0) > len(clients)}
+        except sqlite3.Error as e:
+            self.last_error = f"clients query failed: {e}"
+            return {"clients": [], "unique": 0, "total_requests": 0,
+                    "truncated": False}
 
     def status(self):
         try:
@@ -3532,6 +3590,35 @@ class Handler(BaseHTTPRequestHandler):
                     proxy=q.get("proxy", [""])[0] or None,
                     client=q.get("client", [""])[0] or None,
                     host=q.get("host", [""])[0] or None)})
+        elif route == "/api/clients":
+            if not STORE:
+                self._json({"enabled": False,
+                            "note": "client history needs --db PATH — without "
+                                    "it, clients are only visible while "
+                                    "currently active and are forgotten on "
+                                    "restart"})
+            else:
+                RANGE_HOURS = {"1h": 1, "1d": 24, "2d": 48, "7d": 168,
+                               "15d": 360, "30d": 720, "90d": 2160}
+                rng = q.get("range", ["1d"])[0]
+                now = time.time()
+                since_raw = q.get("since", [""])[0]
+                until_raw = q.get("until", [""])[0]
+                if since_raw:
+                    since = float(since_raw)
+                    until = float(until_raw) if until_raw else now
+                else:
+                    since = now - RANGE_HOURS.get(rng, 24) * 3600
+                    until = now
+                res = STORE.clients(
+                    since=since, until=until,
+                    proxy=q.get("proxy", [""])[0] or None,
+                    limit=int(q.get("limit", ["1000"])[0]))
+                res["enabled"] = True
+                res["range"] = rng if not since_raw else "custom"
+                res["since"] = since
+                res["until"] = until
+                self._json(res)
         elif route == "/api/config":
             pid = q.get("proxy", [""])[0]
             pa = get_policy_admin(None if pid in ("", "all") else pid)
@@ -3972,7 +4059,7 @@ tr.fresh{animation:flash 1.1s ease-out}
 .dimc{color:var(--dim)}
 .slowc{color:var(--err);font-weight:700}
 .filters{display:flex;gap:8px;padding:10px 15px;border-bottom:1px solid var(--line);flex-wrap:wrap}
-input[type=text],select{font:inherit;font-family:var(--mono);font-size:11px;padding:5px 9px;
+input[type=text],input[type=datetime-local],select{font:inherit;font-family:var(--mono);font-size:11px;padding:5px 9px;
   background:var(--bg);color:var(--txt);border:1px solid var(--line);border-radius:6px;outline:none}
 input[type=text]{flex:1;min-width:150px}
 input[type=text]:focus,select:focus{border-color:var(--accent)}
@@ -4227,6 +4314,37 @@ tr.arow:hover .evcue{color:var(--accent,#3b82f6);border-color:var(--accent,#3b82
   <div class="empty" id="feed_empty">waiting for traffic…</div>
 </div>
 
+<div class="card" id="clients_card">
+  <h2>Client history <span class="tag" id="cli_range_tag">last 24h</span>
+    <button id="cli_refresh" style="margin-left:10px">refresh</button></h2>
+  <div class="filters">
+    <div id="cli_ranges" style="display:flex;gap:8px;flex-wrap:wrap">
+      <span class="pchip" data-r="1h">1 hour</span>
+      <span class="pchip sel" data-r="1d">1 day</span>
+      <span class="pchip" data-r="2d">2 days</span>
+      <span class="pchip" data-r="7d">7 days</span>
+      <span class="pchip" data-r="15d">15 days</span>
+      <span class="pchip" data-r="30d">1 month</span>
+      <span class="pchip" data-r="90d">3 months</span>
+      <span class="pchip" data-r="custom">custom…</span>
+    </div>
+    <span id="cli_custom_wrap" style="display:none;gap:6px;align-items:center">
+      <input type="datetime-local" id="cli_since" style="max-width:190px">
+      <span class="dimc">to</span>
+      <input type="datetime-local" id="cli_until" style="max-width:190px">
+      <button id="cli_apply">apply</button>
+    </span>
+    <input type="text" id="cli_q" placeholder="filter by client IP…" style="max-width:200px">
+    <button id="cli_csv">⤓ CSV</button>
+  </div>
+  <div id="cli_summary" style="padding:2px 15px 12px;font-size:13px;color:var(--faint)"></div>
+  <div class="scroll" style="max-height:380px"><table><thead><tr>
+    <th>client</th><th>requests</th><th>bytes</th><th>denied</th><th>errors</th>
+    <th>hosts reached</th><th>first seen</th><th>last seen</th>
+  </tr></thead><tbody id="cli_t"></tbody></table></div>
+  <div class="empty" id="cli_empty" style="display:none"></div>
+</div>
+
 <div class="grid g2">
   <div class="card"><h2>Denied / blocked <span class="tag">policy violations</span></h2>
     <div class="scroll" style="max-height:290px"><table><thead><tr><th>time</th><th>client</th><th>st</th><th>host</th><th>url</th></tr></thead>
@@ -4423,6 +4541,7 @@ const MAXROWS=500;
 let selProxy=sessionStorage.getItem('proxy')||'', proxyList=[], proxyName={};
 const isAll=()=>selProxy==='all';
 const curProxy=()=>selProxy||(proxyList[0]&&proxyList[0].id)||'';
+let cliRange='1d', cliSinceEpoch=null, cliUntilEpoch=null, cliRows=[];
 
 /* ------------------------------------------------------------------ charts */
 function lineChart(el,series){
@@ -5225,7 +5344,7 @@ function switchProxy(pid){
   $('proxy_sel').value=selProxy;
   rows=[]; $('feed').innerHTML=''; lastStats=null;
   document.querySelectorAll('.pcol').forEach(el=>el.style.display=isAll()?'':'none');
-  drawStrip(); refreshNow();
+  drawStrip(); refreshNow(); loadClients();
 }
 async function refreshNow(){
   try{
@@ -5237,6 +5356,109 @@ async function refreshNow(){
 /* the aggregate view is computed server-side on demand, so poll it */
 setInterval(()=>{ if(isAll()) refreshNow(); }, 2500);
 setInterval(loadProxies, 10000);
+
+/* --------------------------------------------------------- client history */
+const RANGE_LABEL={'1h':'last 1 hour','1d':'last 24 hours','2d':'last 2 days',
+  '7d':'last 7 days','15d':'last 15 days','30d':'last 1 month','90d':'last 3 months',
+  'custom':'custom range'};
+async function loadClients(){
+  const p=isAll()?'all':curProxy();
+  const params=new URLSearchParams({proxy:p, limit:'2000'});
+  if(cliRange==='custom' && cliSinceEpoch){
+    params.set('since',cliSinceEpoch);
+    if(cliUntilEpoch) params.set('until',cliUntilEpoch);
+  } else {
+    params.set('range', cliRange);
+  }
+  try{
+    const d=await (await fetch('/api/clients?'+params.toString())).json();
+    if(d.enabled===false){
+      $('cli_t').innerHTML=''; cliRows=[];
+      $('cli_summary').textContent='';
+      $('cli_empty').style.display='block';
+      $('cli_empty').textContent=d.note||'client history is unavailable';
+      return;
+    }
+    cliRows=d.clients||[];
+    $('cli_range_tag').textContent=RANGE_LABEL[cliRange]||cliRange;
+    const since=new Date(d.since*1000), until=new Date(d.until*1000);
+    $('cli_summary').innerHTML=
+      `<b>${fmtN(d.unique||0)}</b> unique client${d.unique===1?'':'s'} &middot; `+
+      `<b>${fmtN(d.total_requests||0)}</b> requests &middot; `+
+      `window ${since.toLocaleString()} &rarr; ${until.toLocaleString()}`+
+      (d.truncated?' <span class="dimc">(list capped — unique count above is exact)</span>':'');
+    drawClients();
+  }catch(e){
+    $('cli_summary').textContent='could not load client history';
+  }
+}
+function drawClients(){
+  const filt=($('cli_q').value||'').trim().toLowerCase();
+  const list=filt?cliRows.filter(c=>c.client.toLowerCase().includes(filt)):cliRows;
+  $('cli_empty').style.display=list.length?'none':'block';
+  $('cli_empty').textContent='no clients matched this window/filter';
+  $('cli_t').innerHTML=list.map(c=>`<tr>
+    <td>${esc(c.client)}</td>
+    <td>${fmtN(c.requests)}</td>
+    <td>${fmtB(c.bytes)}</td>
+    <td>${c.denied?('<span class="s4">'+fmtN(c.denied)+'</span>'):'0'}</td>
+    <td>${c.errors?('<span class="s5">'+fmtN(c.errors)+'</span>'):'0'}</td>
+    <td>${fmtN(c.hosts)}</td>
+    <td>${new Date(c.first_seen*1000).toLocaleString()}</td>
+    <td>${new Date(c.last_seen*1000).toLocaleString()}</td>
+  </tr>`).join('');
+}
+function clientsToCSV(){
+  const head=['client','requests','bytes','denied','errors','hosts_reached','first_seen','last_seen'];
+  const lines=[head.join(',')];
+  const filt=($('cli_q').value||'').trim().toLowerCase();
+  const list=filt?cliRows.filter(c=>c.client.toLowerCase().includes(filt)):cliRows;
+  for(const c of list){
+    lines.push([c.client, c.requests, c.bytes, c.denied, c.errors, c.hosts,
+      new Date(c.first_seen*1000).toISOString(), new Date(c.last_seen*1000).toISOString()
+    ].map(v=>`"${String(v).replace(/"/g,'""')}"`).join(','));
+  }
+  return lines.join('\n');
+}
+function toLocalInputValue(d){
+  const pad=n=>String(n).padStart(2,'0');
+  return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+$('cli_ranges').querySelectorAll('.pchip').forEach(chip=>{
+  chip.onclick=()=>{
+    cliRange=chip.dataset.r;
+    $('cli_ranges').querySelectorAll('.pchip').forEach(c=>c.classList.toggle('sel',c===chip));
+    $('cli_custom_wrap').style.display=cliRange==='custom'?'flex':'none';
+    if(cliRange==='custom'){
+      if(!$('cli_since').value){
+        const now=new Date();
+        $('cli_since').value=toLocalInputValue(new Date(now-24*3600*1000));
+        $('cli_until').value=toLocalInputValue(now);
+      }
+      cliSinceEpoch=new Date($('cli_since').value).getTime()/1000;
+      cliUntilEpoch=new Date($('cli_until').value).getTime()/1000;
+    }
+    loadClients();
+  };
+});
+$('cli_apply').onclick=()=>{
+  if(!$('cli_since').value){return}
+  cliSinceEpoch=new Date($('cli_since').value).getTime()/1000;
+  cliUntilEpoch=$('cli_until').value?new Date($('cli_until').value).getTime()/1000:null;
+  loadClients();
+};
+$('cli_q').addEventListener('input',drawClients);
+$('cli_refresh').onclick=loadClients;
+$('cli_csv').onclick=()=>{
+  const blob=new Blob([clientsToCSV()],{type:'text/csv'});
+  const a=document.createElement('a');
+  a.href=URL.createObjectURL(blob);
+  a.download=`clients_${cliRange}_${Date.now()}.csv`;
+  document.body.appendChild(a); a.click(); a.remove();
+};
+/* historical, not live — a slow poll is enough, and avoids hammering the DB
+   with the same query every couple of seconds */
+setInterval(loadClients, 45000);
 
 /* ------------------------------------------------------------------ sse */
 let es=null, retry=1000;
@@ -5276,6 +5498,7 @@ connect();
 /* ------------------------------------------------------------------ ui */
 $('proxy_sel').onchange=()=>switchProxy($('proxy_sel').value);
 loadProxies().then(refreshNow);
+loadClients();
 $('pause').onclick=()=>{paused=!paused;
   $('pause').textContent=paused?'▶ Resume feed':'⏸ Pause feed';
   $('pause').classList.toggle('act',paused);

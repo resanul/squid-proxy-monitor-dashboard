@@ -77,6 +77,33 @@ restart.
 | `--db-max-gb N` | `5` | Disk budget. Oldest raw requests are pruned first; hourly rollups are kept regardless — they cost almost nothing and are what makes long-term trend charts possible even after raw detail ages out. |
 | `--db-no-urls` | off | Store hostnames but not full URLs — roughly halves the per-request disk cost, and avoids retaining full browsing detail. |
 
+### Client history panel
+
+With `--db` enabled, the **Client history** card answers "who connected, and
+how much did they do" over a selectable window: **1 hour, 1 day, 2 days,
+7 days, 15 days, 1 month, 3 months, or a custom date/time range**, plus a
+free-text filter on the client IP. For each client in the window it shows
+total requests, bytes, denied/error counts, how many distinct destination
+hosts it reached, and its first/last-seen time — exportable as CSV.
+
+This is backed by the `rollup_hour` table, the same hourly aggregate used for
+the long-term trend chart. Unlike the raw `requests` table (pruned to fit
+`--db-max-gb`, oldest rows first), rollups are **never pruned by the disk
+budget** — a few MB per month of traffic, so this is effectively unbounded
+retention in practice. That also means:
+
+- Restarting the dashboard (or the whole `squid-monitor` service) does not
+  lose this data — it lives in the SQLite file on disk, not in memory.
+- "How many unique clients in the last 3 months" stays answerable for as
+  long as the database file exists, independent of how small `--db-max-gb`
+  is set — a tight raw-request budget only affects how far back you can pull
+  individual request-level detail (URLs, exact timestamps of one request).
+
+The underlying endpoint is `GET /api/clients?range=7d` (or `since=<epoch>`
+and optionally `until=<epoch>` for a custom window, plus `proxy=<id>` to
+scope to one proxy) — useful if you want to pull the same numbers from a
+script instead of the UI.
+
 ## Policy and blocklist admin
 
 These let the dashboard write to a proxy, through the root-owned
