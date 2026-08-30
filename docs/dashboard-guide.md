@@ -122,6 +122,13 @@ and optionally `until=<epoch>` for a custom window, plus `proxy=<id>` to
 scope to one proxy) — useful if you want to pull the same numbers from a
 script instead of the UI.
 
+**Click any client row** to see every individual request it made in that
+same window — not just the aggregate counts. This queries the raw
+`requests` table (so it needs data still inside the `--db-max-gb` raw-detail
+window, unlike the aggregate table above which survives indefinitely),
+capped at 1000 rows with a note if more exist; narrow the time range or use
+the modal's CSV export to get the rest. Backed by `GET /api/history?client=…`.
+
 ### System health panel
 
 A separate concern from Squid traffic: **is the machine itself healthy**. A

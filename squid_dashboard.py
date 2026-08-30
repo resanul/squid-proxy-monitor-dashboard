@@ -44,7 +44,7 @@ Reading the log may need group access on the proxy:
     sudo usermod -a -G squid <user>      # or use --ssh-sudo
 """
 
-__version__ = "1.12.0"       # …1.7 policy editor · 1.8 monitor-only · 1.8.1 panel
+__version__ = "1.13.0"       # …1.7 policy editor · 1.8 monitor-only · 1.8.1 panel
                               # feedback fixes · 1.9 client-history panel
                               # (unique/connected clients over selectable time
                               # ranges, backed by the already-unbounded hourly
@@ -58,7 +58,10 @@ __version__ = "1.12.0"       # …1.7 policy editor · 1.8 monitor-only · 1.8.1
                               # 1.12 Denied/Slowest retain up to 1000 rows
                               # server-side (was 120); live SSE ticks still
                               # carry only ~40 for bandwidth, with a
-                              # "load up to 1000" button for the full history
+                              # "load up to 1000" button for the full history ·
+                              # 1.13 click a client in Client history to see
+                              # its full request list for that window (up to
+                              # 1000 rows, from the history database)
 
 import argparse
 import collections
@@ -4540,6 +4543,7 @@ footer{margin-top:22px;color:var(--faint);font-family:var(--mono);font-size:10.5
 .bar.clik:hover{background:rgba(74,158,255,.09)}
 .bar.clik:hover .nm{color:var(--accent)}
 td.clik{cursor:pointer} td.clik:hover{color:var(--accent);text-decoration:underline}
+tr.clik{cursor:pointer;transition:.12s} tr.clik:hover{background:rgba(74,158,255,.09)}
 .dmodal{max-width:1080px}
 .dkpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(118px,1fr));gap:9px;margin-bottom:14px}
 .dk{background:var(--panel2);border:1px solid var(--line);border-radius:9px;padding:9px 11px}
@@ -4869,6 +4873,21 @@ tr.arow:hover .evcue{color:var(--accent,#3b82f6);border-color:var(--accent,#3b82
     <button id="d_block">⛔ Block on proxy</button></div>
 </div></div>
 
+<div class="mask" id="chmask"><div class="modal dmodal">
+  <h3>🖧 <span id="ch_ip">client</span>
+    <span class="rtype" id="ch_sub"></span><span class="x" id="ch_close">×</span></h3>
+  <div class="mbody">
+    <div id="ch_summary" class="dimc" style="font-family:var(--mono);font-size:11.5px;margin-bottom:10px"></div>
+    <div class="scroll" style="max-height:56vh"><table><thead><tr>
+      <th>time</th><th class="pcol">proxy</th><th>m</th><th>st</th><th>outcome</th>
+      <th>action</th><th>bytes</th><th>ms</th><th>host</th><th>url</th>
+    </tr></thead><tbody id="ch_t"></tbody></table></div>
+    <div class="empty" id="ch_empty" style="display:none"></div>
+  </div>
+  <div class="mfoot"><span class="note" id="ch_note"></span>
+    <button id="ch_csv">⤓ CSV</button></div>
+</div></div>
+
 <div class="mask" id="evmask"><div class="modal dmodal">
   <h3>⚠ <span id="ev_title">alert detail</span><span class="x" id="ev_close">×</span></h3>
   <div class="mbody" id="ev_body"></div>
@@ -4908,6 +4927,7 @@ let selProxy=sessionStorage.getItem('proxy')||'', proxyList=[], proxyName={};
 const isAll=()=>selProxy==='all';
 const curProxy=()=>selProxy||(proxyList[0]&&proxyList[0].id)||'';
 let cliRange='1d', cliSinceEpoch=null, cliUntilEpoch=null, cliRows=[];
+let cliWindow={since:null, until:null};   // the window currently shown in Client history
 
 /* ------------------------------------------------------------------ charts */
 function lineChart(el,series){
@@ -5783,6 +5803,76 @@ function renderDetail(d){
   $('d_block').textContent=isClient?'⛔ Block this IP':'⛔ Block this domain';
 }
 
+/* ------------------------------------------------------ client full history */
+/* Clicking a row in the Client history panel — unlike openDetail() above
+   (which only shows the last ~15 live in-memory requests), this pulls every
+   retained request for that client in the SAME time window currently
+   selected in the panel, straight from the history database. */
+let chRows=[];
+async function openClientHistory(ip){
+  $('ch_ip').textContent=ip;
+  $('ch_sub').textContent=RANGE_LABEL[cliRange]||'';
+  $('ch_summary').textContent='loading…';
+  $('ch_t').innerHTML=''; $('ch_empty').style.display='none';
+  $('ch_note').textContent='';
+  $('chmask').classList.add('on');
+  const params=new URLSearchParams({client:ip, limit:'1000',
+    proxy:isAll()?'all':curProxy()});
+  if(cliWindow.since) params.set('since', cliWindow.since);
+  if(cliWindow.until) params.set('until', cliWindow.until);
+  try{
+    const d=await (await fetch('/api/history?'+params.toString())).json();
+    if(d.enabled===false){
+      $('ch_summary').textContent='';
+      $('ch_empty').style.display='block';
+      $('ch_empty').textContent=d.note||'request history needs --db PATH';
+      return;
+    }
+    chRows=d.rows||[];
+    const since=cliWindow.since?new Date(cliWindow.since*1000).toLocaleString():'—';
+    const until=cliWindow.until?new Date(cliWindow.until*1000).toLocaleString():'—';
+    $('ch_summary').innerHTML=`<b>${fmtN(chRows.length)}</b> request${chRows.length===1?'':'s'} `+
+      `&middot; window ${esc(since)} &rarr; ${esc(until)}`+
+      (chRows.length>=1000?' <span class="dimc">(capped at 1000 — narrow the time range or use CSV for more)</span>':'');
+    $('ch_empty').style.display=chRows.length?'none':'block';
+    $('ch_empty').textContent='no requests from this client in this window';
+    $('ch_t').innerHTML=chRows.map(r=>`<tr>
+      <td class="dimc">${new Date(r.ts*1000).toLocaleString()}</td>
+      <td class="pcol">${esc(proxyName[r.proxy]||r.proxy||'')}</td>
+      <td>${esc(r.method)}</td><td class="${sclass(r.status)}">${r.status}</td>
+      <td><span class="k ${esc(r.kind)}">${esc(r.kind)}</span></td>
+      <td class="dimc">${esc(r.action)}</td>
+      <td>${fmtB(r.bytes)}</td>
+      <td class="${r.ms>=2000?'slowc':'dimc'}">${r.ms||'-'}</td>
+      <td>${esc(r.host)}</td>
+      <td class="dimc" title="${esc(r.url)}">${esc(r.url)}</td></tr>`).join('');
+    document.querySelectorAll('#chmask .pcol').forEach(el=>el.style.display=isAll()?'':'none');
+  }catch(e){
+    $('ch_summary').textContent='';
+    $('ch_empty').style.display='block';
+    $('ch_empty').textContent='could not load request history';
+  }
+}
+function clientHistoryToCSV(){
+  const head=['time','proxy','method','status','outcome','action','bytes','ms','host','url'];
+  const lines=[head.join(',')];
+  for(const r of chRows){
+    lines.push([new Date(r.ts*1000).toISOString(), r.proxy, r.method, r.status,
+      r.kind, r.action, r.bytes, r.ms, r.host, r.url
+    ].map(v=>`"${String(v==null?'':v).replace(/"/g,'""')}"`).join(','));
+  }
+  return lines.join('\n');
+}
+$('ch_close').onclick=()=>$('chmask').classList.remove('on');
+$('chmask').onclick=e=>{if(e.target===$('chmask'))$('chmask').classList.remove('on')};
+$('ch_csv').onclick=()=>{
+  const blob=new Blob([clientHistoryToCSV()],{type:'text/csv'});
+  const a=document.createElement('a');
+  a.href=URL.createObjectURL(blob);
+  a.download=`client_${$('ch_ip').textContent}_requests.csv`;
+  document.body.appendChild(a); a.click(); a.remove();
+};
+
 /* -------------------------------------------------------------- proxies */
 async function loadProxies(){
   try{
@@ -5856,6 +5946,7 @@ async function loadClients(){
       return;
     }
     cliRows=d.clients||[];
+    cliWindow={since:d.since, until:d.until};
     $('cli_range_tag').textContent=RANGE_LABEL[cliRange]||cliRange;
     const since=new Date(d.since*1000), until=new Date(d.until*1000);
     $('cli_summary').innerHTML=
@@ -5873,7 +5964,7 @@ function drawClients(){
   const list=filt?cliRows.filter(c=>c.client.toLowerCase().includes(filt)):cliRows;
   $('cli_empty').style.display=list.length?'none':'block';
   $('cli_empty').textContent='no clients matched this window/filter';
-  $('cli_t').innerHTML=list.map(c=>`<tr>
+  $('cli_t').innerHTML=list.map(c=>`<tr class="clik" data-ip="${esc(c.client)}" title="click to see every request from this client in the selected window">
     <td>${esc(c.client)}</td>
     <td>${fmtN(c.requests)}</td>
     <td>${fmtB(c.bytes)}</td>
@@ -5883,6 +5974,8 @@ function drawClients(){
     <td>${new Date(c.first_seen*1000).toLocaleString()}</td>
     <td>${new Date(c.last_seen*1000).toLocaleString()}</td>
   </tr>`).join('');
+  $('cli_t').querySelectorAll('tr.clik').forEach(tr=>
+    tr.onclick=()=>openClientHistory(tr.dataset.ip));
 }
 function clientsToCSV(){
   const head=['client','requests','bytes','denied','errors','hosts_reached','first_seen','last_seen'];
@@ -6075,7 +6168,7 @@ $('evmask').onclick=e=>{if(e.target.id==='evmask')$('evmask').classList.remove('
 document.addEventListener('keydown',e=>{if(e.key==='Escape'){
   $('mask').classList.remove('on'); $('dmask').classList.remove('on');
   $('evmask').classList.remove('on'); $('pmask').classList.remove('on');
-  $('cmask').classList.remove('on')}});
+  $('cmask').classList.remove('on'); $('chmask').classList.remove('on')}});
 $('pol_btn').onclick=()=>{$('pmask').classList.add('on');
   if(polToken){$('pol_token').value=polToken;polLoad()}};
 $('pol_close').onclick=()=>$('pmask').classList.remove('on');
