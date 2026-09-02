@@ -44,7 +44,7 @@ Reading the log may need group access on the proxy:
     sudo usermod -a -G squid <user>      # or use --ssh-sudo
 """
 
-__version__ = "1.13.0"       # …1.7 policy editor · 1.8 monitor-only · 1.8.1 panel
+__version__ = "1.14.0"       # …1.7 policy editor · 1.8 monitor-only · 1.8.1 panel
                               # feedback fixes · 1.9 client-history panel
                               # (unique/connected clients over selectable time
                               # ranges, backed by the already-unbounded hourly
@@ -61,7 +61,11 @@ __version__ = "1.13.0"       # …1.7 policy editor · 1.8 monitor-only · 1.8.1
                               # "load up to 1000" button for the full history ·
                               # 1.13 click a client in Client history to see
                               # its full request list for that window (up to
-                              # 1000 rows, from the history database)
+                              # 1000 rows, from the history database) · 1.14
+                              # the client-history modal is now a standalone IP
+                              # search (own range picker, 1h-3mo or custom, any
+                              # IP typed in) with client-side status/host/
+                              # outcome/action filters over the fetched rows
 
 import argparse
 import collections
@@ -4877,14 +4881,44 @@ tr.arow:hover .evcue{color:var(--accent,#3b82f6);border-color:var(--accent,#3b82
   <h3>🖧 <span id="ch_ip">client</span>
     <span class="rtype" id="ch_sub"></span><span class="x" id="ch_close">×</span></h3>
   <div class="mbody">
+    <div class="filters" style="padding:0 0 10px;border-bottom:1px solid var(--line);margin-bottom:10px">
+      <input type="text" id="ch_search_ip" placeholder="search a different IP…" style="min-width:160px">
+      <button id="ch_go">Search</button>
+      <div id="ch_ranges" style="display:flex;gap:6px;flex-wrap:wrap">
+        <span class="pchip" data-r="1h">1h</span>
+        <span class="pchip sel" data-r="1d">1d</span>
+        <span class="pchip" data-r="2d">2d</span>
+        <span class="pchip" data-r="7d">7d</span>
+        <span class="pchip" data-r="15d">15d</span>
+        <span class="pchip" data-r="30d">1mo</span>
+        <span class="pchip" data-r="90d">3mo</span>
+        <span class="pchip" data-r="custom">custom…</span>
+      </div>
+      <span id="ch_custom_wrap" style="display:none;gap:6px;align-items:center">
+        <input type="datetime-local" id="ch_since_in" style="max-width:190px">
+        <span class="dimc">to</span>
+        <input type="datetime-local" id="ch_until_in" style="max-width:190px">
+        <button id="ch_apply">apply</button>
+      </span>
+    </div>
+    <div class="filters" style="padding:0 0 10px">
+      <input type="text" id="ch_f_status" placeholder="status (e.g. 403 or 4)" style="max-width:150px">
+      <input type="text" id="ch_f_host" placeholder="host contains…" style="max-width:200px">
+      <select id="ch_f_kind"><option value="">all outcomes</option><option value="hit">hit</option>
+        <option value="miss">miss</option><option value="denied">denied</option><option value="error">error</option></select>
+      <input type="text" id="ch_f_action" placeholder="action contains…" style="max-width:170px">
+      <button id="ch_f_clear">clear filters</button>
+    </div>
     <div id="ch_summary" class="dimc" style="font-family:var(--mono);font-size:11.5px;margin-bottom:10px"></div>
-    <div class="scroll" style="max-height:56vh"><table><thead><tr>
+    <div class="scroll" style="max-height:50vh"><table><thead><tr>
       <th>time</th><th class="pcol">proxy</th><th>m</th><th>st</th><th>outcome</th>
       <th>action</th><th>bytes</th><th>ms</th><th>host</th><th>url</th>
     </tr></thead><tbody id="ch_t"></tbody></table></div>
     <div class="empty" id="ch_empty" style="display:none"></div>
   </div>
-  <div class="mfoot"><span class="note" id="ch_note"></span>
+  <div class="mfoot"><span class="note" id="ch_note">note: full per-request detail only goes back as far as
+    --db-max-gb keeps raw rows (often 1-3 weeks) — the aggregate counts in the
+    Client history table behind this go back the full 3 months regardless</span>
     <button id="ch_csv">⤓ CSV</button></div>
 </div></div>
 
@@ -5806,52 +5840,84 @@ function renderDetail(d){
 /* ------------------------------------------------------ client full history */
 /* Clicking a row in the Client history panel — unlike openDetail() above
    (which only shows the last ~15 live in-memory requests), this pulls every
-   retained request for that client in the SAME time window currently
-   selected in the panel, straight from the history database. */
-let chRows=[];
+   retained request for that client from the history database. It also works
+   as a standalone IP search: its own range picker (1h up to 3 months, or a
+   custom span) is independent of whatever range the Client history panel
+   behind it happens to be showing, and the IP itself can be changed without
+   closing the modal. */
+let chRows=[], chAllRows=[], chIp=null, chRange='1d', chSinceEpoch=null, chUntilEpoch=null;
 async function openClientHistory(ip){
-  $('ch_ip').textContent=ip;
-  $('ch_sub').textContent=RANGE_LABEL[cliRange]||'';
+  chIp=ip; chRange=cliRange; chSinceEpoch=cliWindow.since; chUntilEpoch=cliWindow.until;
+  $('ch_search_ip').value=ip;
+  $('ch_ranges').querySelectorAll('.pchip').forEach(c=>
+    c.classList.toggle('sel', c.dataset.r===chRange));
+  $('ch_custom_wrap').style.display='none';
+  $('chmask').classList.add('on');
+  await loadClientHistory();
+}
+async function loadClientHistory(){
+  if(!chIp) return;
+  $('ch_ip').textContent=chIp;
+  $('ch_sub').textContent=RANGE_LABEL[chRange]||'';
   $('ch_summary').textContent='loading…';
   $('ch_t').innerHTML=''; $('ch_empty').style.display='none';
-  $('ch_note').textContent='';
-  $('chmask').classList.add('on');
-  const params=new URLSearchParams({client:ip, limit:'1000',
-    proxy:isAll()?'all':curProxy()});
-  if(cliWindow.since) params.set('since', cliWindow.since);
-  if(cliWindow.until) params.set('until', cliWindow.until);
+  const RANGE_HOURS={'1h':1,'1d':24,'2d':48,'7d':168,'15d':360,'30d':720,'90d':2160};
+  const now=Date.now()/1000;
+  let since=chSinceEpoch, until=chUntilEpoch;
+  if(chRange!=='custom' || !since){ since=now-(RANGE_HOURS[chRange]||24)*3600; until=now; }
+  const params=new URLSearchParams({client:chIp, limit:'1000',
+    proxy:isAll()?'all':curProxy(), since:String(since), until:String(until)});
   try{
     const d=await (await fetch('/api/history?'+params.toString())).json();
     if(d.enabled===false){
       $('ch_summary').textContent='';
       $('ch_empty').style.display='block';
       $('ch_empty').textContent=d.note||'request history needs --db PATH';
+      chAllRows=[]; applyChFilters();
       return;
     }
-    chRows=d.rows||[];
-    const since=cliWindow.since?new Date(cliWindow.since*1000).toLocaleString():'—';
-    const until=cliWindow.until?new Date(cliWindow.until*1000).toLocaleString():'—';
-    $('ch_summary').innerHTML=`<b>${fmtN(chRows.length)}</b> request${chRows.length===1?'':'s'} `+
-      `&middot; window ${esc(since)} &rarr; ${esc(until)}`+
-      (chRows.length>=1000?' <span class="dimc">(capped at 1000 — narrow the time range or use CSV for more)</span>':'');
-    $('ch_empty').style.display=chRows.length?'none':'block';
-    $('ch_empty').textContent='no requests from this client in this window';
-    $('ch_t').innerHTML=chRows.map(r=>`<tr>
-      <td class="dimc">${new Date(r.ts*1000).toLocaleString()}</td>
-      <td class="pcol">${esc(proxyName[r.proxy]||r.proxy||'')}</td>
-      <td>${esc(r.method)}</td><td class="${sclass(r.status)}">${r.status}</td>
-      <td><span class="k ${esc(r.kind)}">${esc(r.kind)}</span></td>
-      <td class="dimc">${esc(r.action)}</td>
-      <td>${fmtB(r.bytes)}</td>
-      <td class="${r.ms>=2000?'slowc':'dimc'}">${r.ms||'-'}</td>
-      <td>${esc(r.host)}</td>
-      <td class="dimc" title="${esc(r.url)}">${esc(r.url)}</td></tr>`).join('');
+    chAllRows=d.rows||[];
+    const sinceS=new Date(since*1000).toLocaleString(), untilS=new Date(until*1000).toLocaleString();
+    $('ch_summary').dataset.window=`window ${esc(sinceS)} &rarr; ${esc(untilS)}`;
+    $('ch_summary').dataset.capped=chAllRows.length>=1000?'1':'';
+    applyChFilters();
     document.querySelectorAll('#chmask .pcol').forEach(el=>el.style.display=isAll()?'':'none');
   }catch(e){
     $('ch_summary').textContent='';
     $('ch_empty').style.display='block';
     $('ch_empty').textContent='could not load request history';
   }
+}
+function applyChFilters(){
+  const fStatus=($('ch_f_status').value||'').trim();
+  const fHost=($('ch_f_host').value||'').trim().toLowerCase();
+  const fKind=$('ch_f_kind').value;
+  const fAction=($('ch_f_action').value||'').trim().toLowerCase();
+  chRows=chAllRows.filter(r=>
+    (!fStatus || String(r.status||'').includes(fStatus)) &&
+    (!fHost || (r.host||'').toLowerCase().includes(fHost)) &&
+    (!fKind || r.kind===fKind) &&
+    (!fAction || (r.action||'').toLowerCase().includes(fAction)));
+  const win=$('ch_summary').dataset.window||'';
+  const capped=$('ch_summary').dataset.capped==='1';
+  const filtered=chRows.length!==chAllRows.length;
+  $('ch_summary').innerHTML=`<b>${fmtN(chRows.length)}</b> request${chRows.length===1?'':'s'}`+
+    (filtered?` <span class="dimc">(of ${fmtN(chAllRows.length)} fetched)</span>`:'')+
+    ` &middot; ${win}`+
+    (capped?' <span class="dimc">(fetch capped at 1000 — narrow the time range or use CSV for more)</span>':'');
+  $('ch_empty').style.display=chRows.length?'none':'block';
+  $('ch_empty').textContent=chAllRows.length?'no requests match these filters':'no requests from this client in this window';
+  $('ch_t').innerHTML=chRows.map(r=>`<tr>
+    <td class="dimc">${new Date(r.ts*1000).toLocaleString()}</td>
+    <td class="pcol">${esc(proxyName[r.proxy]||r.proxy||'')}</td>
+    <td>${esc(r.method)}</td><td class="${sclass(r.status)}">${r.status}</td>
+    <td><span class="k ${esc(r.kind)}">${esc(r.kind)}</span></td>
+    <td class="dimc">${esc(r.action)}</td>
+    <td>${fmtB(r.bytes)}</td>
+    <td class="${r.ms>=2000?'slowc':'dimc'}">${r.ms||'-'}</td>
+    <td>${esc(r.host)}</td>
+    <td class="dimc" title="${esc(r.url)}">${esc(r.url)}</td></tr>`).join('');
+  document.querySelectorAll('#chmask .pcol').forEach(el=>el.style.display=isAll()?'':'none');
 }
 function clientHistoryToCSV(){
   const head=['time','proxy','method','status','outcome','action','bytes','ms','host','url'];
@@ -5869,8 +5935,45 @@ $('ch_csv').onclick=()=>{
   const blob=new Blob([clientHistoryToCSV()],{type:'text/csv'});
   const a=document.createElement('a');
   a.href=URL.createObjectURL(blob);
-  a.download=`client_${$('ch_ip').textContent}_requests.csv`;
+  a.download=`client_${chIp||'unknown'}_requests.csv`;
   document.body.appendChild(a); a.click(); a.remove();
+};
+$('ch_go').onclick=()=>{
+  const v=($('ch_search_ip').value||'').trim();
+  if(!v) return;
+  chIp=v; loadClientHistory();
+};
+$('ch_search_ip').addEventListener('keydown',e=>{if(e.key==='Enter')$('ch_go').click()});
+$('ch_ranges').querySelectorAll('.pchip').forEach(chip=>{
+  chip.onclick=()=>{
+    chRange=chip.dataset.r;
+    $('ch_ranges').querySelectorAll('.pchip').forEach(c=>c.classList.toggle('sel',c===chip));
+    $('ch_custom_wrap').style.display=chRange==='custom'?'flex':'none';
+    if(chRange==='custom'){
+      if(!$('ch_since_in').value){
+        const now=new Date();
+        $('ch_since_in').value=toLocalInputValue(new Date(now-24*3600*1000));
+        $('ch_until_in').value=toLocalInputValue(now);
+      }
+      chSinceEpoch=new Date($('ch_since_in').value).getTime()/1000;
+      chUntilEpoch=new Date($('ch_until_in').value).getTime()/1000;
+    }
+    loadClientHistory();
+  };
+});
+$('ch_apply').onclick=()=>{
+  if(!$('ch_since_in').value) return;
+  chSinceEpoch=new Date($('ch_since_in').value).getTime()/1000;
+  chUntilEpoch=$('ch_until_in').value?new Date($('ch_until_in').value).getTime()/1000:null;
+  loadClientHistory();
+};
+['ch_f_status','ch_f_host','ch_f_action'].forEach(id=>
+  $(id).addEventListener('input',applyChFilters));
+$('ch_f_kind').addEventListener('change',applyChFilters);
+$('ch_f_clear').onclick=()=>{
+  $('ch_f_status').value=''; $('ch_f_host').value='';
+  $('ch_f_kind').value=''; $('ch_f_action').value='';
+  applyChFilters();
 };
 
 /* -------------------------------------------------------------- proxies */

@@ -122,12 +122,25 @@ and optionally `until=<epoch>` for a custom window, plus `proxy=<id>` to
 scope to one proxy) — useful if you want to pull the same numbers from a
 script instead of the UI.
 
-**Click any client row** to see every individual request it made in that
-same window — not just the aggregate counts. This queries the raw
-`requests` table (so it needs data still inside the `--db-max-gb` raw-detail
-window, unlike the aggregate table above which survives indefinitely),
-capped at 1000 rows with a note if more exist; narrow the time range or use
-the modal's CSV export to get the rest. Backed by `GET /api/history?client=…`.
+**Click any client row** to see every individual request it made — not just
+the aggregate counts. The popup this opens is also a standalone IP search:
+
+- Its own range picker (**1h, 1d, 2d, 7d, 15d, 1mo, 3mo, or custom**) is
+  independent of whatever range the Client history table behind it is
+  showing — widen it to 3 months without changing the main table.
+- A search box lets you type in a *different* IP without closing the
+  popup — this isn't limited to IPs that happen to already be in the Client
+  history table for the currently selected range.
+- Filter the fetched rows by **status code, host (contains), outcome
+  (hit/miss/denied/error), and action** — all client-side over whatever was
+  already fetched, so adjusting a filter is instant, no re-fetch.
+
+This queries the raw `requests` table (so it needs data still inside the
+`--db-max-gb` raw-detail window — often 1-3 weeks — unlike the aggregate
+Client history table above it, which survives the full 3 months regardless
+of that budget), capped at 1000 rows per fetch with a note if more exist;
+narrow the time range or use the popup's CSV export to get the rest. Backed
+by `GET /api/history?client=…&since=…&until=…`.
 
 ### System health panel
 
