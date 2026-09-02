@@ -135,12 +135,39 @@ the aggregate counts. The popup this opens is also a standalone IP search:
   (hit/miss/denied/error), and action** — all client-side over whatever was
   already fetched, so adjusting a filter is instant, no re-fetch.
 
-This queries the raw `requests` table (so it needs data still inside the
-`--db-max-gb` raw-detail window — often 1-3 weeks — unlike the aggregate
-Client history table above it, which survives the full 3 months regardless
-of that budget), capped at 1000 rows per fetch with a note if more exist;
-narrow the time range or use the popup's CSV export to get the rest. Backed
-by `GET /api/history?client=…&since=…&until=…`.
+This queries the raw `requests` table, so it needs data still inside the
+`--db-max-gb` raw-detail window — **this is the real ceiling on "3 months of
+traffic," not any UI limit**. Each fetch pulls up to 5000 rows at a time and
+a **"load older"** button pages backward through everything else retained
+for the window — for a client with tens of thousands of logged requests
+this means clicking through several pages, but nothing within the retained
+window is ever unreachable. The aggregate Client history table above it
+survives the full 3 months regardless of this budget, because it's backed
+by the tiny `rollup_hour` table instead. Backed by
+`GET /api/history?client=…&since=…&until=…`.
+
+#### Sizing `--db-max-gb` to actually keep 3 months of raw detail
+
+At roughly 36 requests/sec across a fleet, full raw rows (with URLs) cost
+about **0.55 GB/day** — so 90 days needs roughly **50 GB** (`--db-no-urls`
+roughly halves that, to **~25 GB**). The default install uses `--db-max-gb 5`
+(about 9 days) — deliberately conservative, since the file lives on disk and
+a wrong guess either wastes space or gets pruned sooner than expected.
+
+To raise it: edit the `--db-max-gb` value in the systemd unit
+(`/etc/systemd/system/squid-monitor.service`'s `ExecStart` line — or run
+`sudo systemctl edit --full squid-monitor`), then:
+
+```bash
+df -h /var/lib/squid-monitor      # confirm the disk actually has the room first
+sudo systemctl daemon-reload
+sudo systemctl restart squid-monitor
+```
+
+The budget only ever prunes the raw `requests` table (oldest rows first) —
+it never touches `rollup_hour`, so raising it later doesn't retroactively
+recover anything already pruned, but lowering it later doesn't lose the
+aggregate history either.
 
 ### System health panel
 

@@ -44,7 +44,7 @@ Reading the log may need group access on the proxy:
     sudo usermod -a -G squid <user>      # or use --ssh-sudo
 """
 
-__version__ = "1.14.0"       # …1.7 policy editor · 1.8 monitor-only · 1.8.1 panel
+__version__ = "1.15.0"       # …1.7 policy editor · 1.8 monitor-only · 1.8.1 panel
                               # feedback fixes · 1.9 client-history panel
                               # (unique/connected clients over selectable time
                               # ranges, backed by the already-unbounded hourly
@@ -65,7 +65,12 @@ __version__ = "1.14.0"       # …1.7 policy editor · 1.8 monitor-only · 1.8.1
                               # the client-history modal is now a standalone IP
                               # search (own range picker, 1h-3mo or custom, any
                               # IP typed in) with client-side status/host/
-                              # outcome/action filters over the fetched rows
+                              # outcome/action filters over the fetched rows ·
+                              # 1.15 client-history request list now pages
+                              # ("load older") through EVERY retained row for
+                              # the window instead of stopping at the first
+                              # 1000 — the real ceiling on "3 months of
+                              # traffic" is --db-max-gb, not this UI cap
 
 import argparse
 import collections
@@ -927,7 +932,10 @@ class Store:
             sql.append("AND (url LIKE ? OR host LIKE ? OR client LIKE ?)")
             args += [f"%{q}%"] * 3
         sql.append("ORDER BY ts DESC LIMIT ?")
-        args.append(max(1, min(int(limit), 2000)))
+        # 5000, not 2000: a single busy client can log >1000 requests/day
+        # (seen in practice), and the UI now pages through this with a
+        # "load older" button rather than being stuck at the first page
+        args.append(max(1, min(int(limit), 5000)))
         cols = ["ts", "proxy", "client", "host", "method", "url", "status",
                 "bytes", "ms", "kind", "action"]
         try:
@@ -4915,6 +4923,9 @@ tr.arow:hover .evcue{color:var(--accent,#3b82f6);border-color:var(--accent,#3b82
       <th>action</th><th>bytes</th><th>ms</th><th>host</th><th>url</th>
     </tr></thead><tbody id="ch_t"></tbody></table></div>
     <div class="empty" id="ch_empty" style="display:none"></div>
+    <div style="text-align:center;margin-top:8px">
+      <button id="ch_more" style="display:none">⤓ load older</button>
+    </div>
   </div>
   <div class="mfoot"><span class="note" id="ch_note">note: full per-request detail only goes back as far as
     --db-max-gb keeps raw rows (often 1-3 weeks) — the aggregate counts in the
@@ -5845,7 +5856,9 @@ function renderDetail(d){
    custom span) is independent of whatever range the Client history panel
    behind it happens to be showing, and the IP itself can be changed without
    closing the modal. */
+const CH_PAGE=2000;   // rows per fetch — "load older" pages beyond this
 let chRows=[], chAllRows=[], chIp=null, chRange='1d', chSinceEpoch=null, chUntilEpoch=null;
+let chWinSince=null, chWinUntil=null, chCursor=null, chMoreAvailable=false, chLoading=false;
 async function openClientHistory(ip){
   chIp=ip; chRange=cliRange; chSinceEpoch=cliWindow.since; chUntilEpoch=cliWindow.until;
   $('ch_search_ip').value=ip;
@@ -5861,31 +5874,51 @@ async function loadClientHistory(){
   $('ch_sub').textContent=RANGE_LABEL[chRange]||'';
   $('ch_summary').textContent='loading…';
   $('ch_t').innerHTML=''; $('ch_empty').style.display='none';
+  $('ch_more').style.display='none';
   const RANGE_HOURS={'1h':1,'1d':24,'2d':48,'7d':168,'15d':360,'30d':720,'90d':2160};
   const now=Date.now()/1000;
   let since=chSinceEpoch, until=chUntilEpoch;
   if(chRange!=='custom' || !since){ since=now-(RANGE_HOURS[chRange]||24)*3600; until=now; }
-  const params=new URLSearchParams({client:chIp, limit:'1000',
-    proxy:isAll()?'all':curProxy(), since:String(since), until:String(until)});
+  chWinSince=since; chWinUntil=until; chCursor=until; chAllRows=[];
+  await fetchChPage();
+}
+async function fetchChPage(){
+  if(chLoading) return;
+  chLoading=true;
+  $('ch_more').textContent='loading…'; $('ch_more').disabled=true;
+  const params=new URLSearchParams({client:chIp, limit:String(CH_PAGE),
+    proxy:isAll()?'all':curProxy(), since:String(chWinSince), until:String(chCursor)});
   try{
     const d=await (await fetch('/api/history?'+params.toString())).json();
     if(d.enabled===false){
       $('ch_summary').textContent='';
       $('ch_empty').style.display='block';
       $('ch_empty').textContent=d.note||'request history needs --db PATH';
-      chAllRows=[]; applyChFilters();
+      chAllRows=[]; chMoreAvailable=false; applyChFilters();
       return;
     }
-    chAllRows=d.rows||[];
-    const sinceS=new Date(since*1000).toLocaleString(), untilS=new Date(until*1000).toLocaleString();
+    const page=d.rows||[];
+    chAllRows=chAllRows.concat(page);
+    // rows come back newest-first; the oldest ts in this page becomes the
+    // exclusive upper bound for the next (older) page
+    if(page.length){
+      const oldest=Math.min(...page.map(r=>r.ts));
+      chCursor=oldest-0.001;
+    }
+    chMoreAvailable=page.length>=CH_PAGE && chCursor>chWinSince;
+    const sinceS=new Date(chWinSince*1000).toLocaleString(), untilS=new Date(chWinUntil*1000).toLocaleString();
     $('ch_summary').dataset.window=`window ${esc(sinceS)} &rarr; ${esc(untilS)}`;
-    $('ch_summary').dataset.capped=chAllRows.length>=1000?'1':'';
     applyChFilters();
     document.querySelectorAll('#chmask .pcol').forEach(el=>el.style.display=isAll()?'':'none');
   }catch(e){
     $('ch_summary').textContent='';
     $('ch_empty').style.display='block';
     $('ch_empty').textContent='could not load request history';
+    chMoreAvailable=false;
+  }finally{
+    chLoading=false;
+    $('ch_more').disabled=false; $('ch_more').textContent='⤓ load older';
+    $('ch_more').style.display=chMoreAvailable?'':'none';
   }
 }
 function applyChFilters(){
@@ -5899,12 +5932,11 @@ function applyChFilters(){
     (!fKind || r.kind===fKind) &&
     (!fAction || (r.action||'').toLowerCase().includes(fAction)));
   const win=$('ch_summary').dataset.window||'';
-  const capped=$('ch_summary').dataset.capped==='1';
   const filtered=chRows.length!==chAllRows.length;
   $('ch_summary').innerHTML=`<b>${fmtN(chRows.length)}</b> request${chRows.length===1?'':'s'}`+
-    (filtered?` <span class="dimc">(of ${fmtN(chAllRows.length)} fetched)</span>`:'')+
+    (filtered?` <span class="dimc">(of ${fmtN(chAllRows.length)} loaded)</span>`:'')+
     ` &middot; ${win}`+
-    (capped?' <span class="dimc">(fetch capped at 1000 — narrow the time range or use CSV for more)</span>':'');
+    (chMoreAvailable?' <span class="dimc">(more exist — click "load older" below)</span>':'');
   $('ch_empty').style.display=chRows.length?'none':'block';
   $('ch_empty').textContent=chAllRows.length?'no requests match these filters':'no requests from this client in this window';
   $('ch_t').innerHTML=chRows.map(r=>`<tr>
@@ -5975,6 +6007,7 @@ $('ch_f_clear').onclick=()=>{
   $('ch_f_kind').value=''; $('ch_f_action').value='';
   applyChFilters();
 };
+$('ch_more').onclick=fetchChPage;
 
 /* -------------------------------------------------------------- proxies */
 async function loadProxies(){
