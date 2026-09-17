@@ -207,6 +207,22 @@ click it again to go back to the live 40-row view. Switching proxies resets
 back to live automatically, since a frozen list belongs to whichever proxy
 it was loaded for.
 
+### A proxy's system clock affects its req/sec, not its totals
+
+Req/sec, bytes/sec, and the Traffic rate chart are all computed from
+timestamps Squid itself writes into that proxy's `access.log` — i.e. that
+proxy's own clock, not the dashboard host's. As of 1.16 the rate window is
+anchored to the latest timestamp actually seen from each proxy, so a proxy
+running behind on NTP still shows a correct *relative* rate. Before 1.16, a
+proxy whose clock disagreed with the dashboard host by more than ~2 minutes
+(`RATE_WINDOW`) showed a flat 0 req/sec forever — while its request/denied/
+host counters, which aren't time-windowed, kept climbing normally. If you
+ever see one specific proxy stuck at 0 req/sec while its other numbers
+climb, check that proxy's clock (`date` vs the management host, or
+`chronyc tracking`) regardless of dashboard version — a large clock offset
+is still worth fixing on its own merits (TLS validation, log correlation,
+cron accuracy).
+
 ## Policy and blocklist admin
 
 These let the dashboard write to a proxy, through the root-owned

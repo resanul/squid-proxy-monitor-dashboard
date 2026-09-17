@@ -44,7 +44,7 @@ Reading the log may need group access on the proxy:
     sudo usermod -a -G squid <user>      # or use --ssh-sudo
 """
 
-__version__ = "1.15.0"       # …1.7 policy editor · 1.8 monitor-only · 1.8.1 panel
+__version__ = "1.16.0"       # …1.7 policy editor · 1.8 monitor-only · 1.8.1 panel
                               # feedback fixes · 1.9 client-history panel
                               # (unique/connected clients over selectable time
                               # ranges, backed by the already-unbounded hourly
@@ -70,7 +70,15 @@ __version__ = "1.15.0"       # …1.7 policy editor · 1.8 monitor-only · 1.8.1
                               # ("load older") through EVERY retained row for
                               # the window instead of stopping at the first
                               # 1000 — the real ceiling on "3 months of
-                              # traffic" is --db-max-gb, not this UI cap
+                              # traffic" is --db-max-gb, not this UI cap · 1.16
+                              # BUGFIX: req/sec and the traffic-rate chart were
+                              # anchored to this host's wall clock, so a proxy
+                              # with a skewed system clock showed a flat 0
+                              # rate forever even while its request/denied/
+                              # host counters kept climbing correctly. Now
+                              # anchored to that proxy's own latest logged
+                              # timestamp instead — immune to clock drift on
+                              # any proxy, present or future
 
 import argparse
 import collections
@@ -296,6 +304,14 @@ class Stats:
         self.parse_errors = 0
         self.cache_mgr = {}
         self.last_event = 0.0
+        # the latest rec["ts"] seen — that's the PROXY's own clock (Squid
+        # timestamps its own log lines), not this dashboard host's. Used to
+        # anchor the rate window so a proxy with a skewed system clock still
+        # shows a correct relative req/sec instead of a flat zero (the window
+        # would otherwise be built against time.time() on THIS host, and any
+        # proxy whose clock disagrees by more than RATE_WINDOW seconds would
+        # never have its records land inside that window at all).
+        self.last_rec_ts = 0.0
         # where traffic is coming from, and whether that link is currently up
         self.source = {"kind": "none", "target": "—", "connected": False,
                        "error": None, "reconnects": 0, "hint": None}
@@ -339,6 +355,8 @@ class Stats:
                 self._prune(self.cdetail)
                 self._prune(self.hdetail)
             self.last_event = time.time()
+            if rec["ts"] and rec["ts"] > self.last_rec_ts:
+                self.last_rec_ts = rec["ts"]
 
             sec = int(rec["ts"])
             if self._cur_sec is None:
@@ -515,7 +533,12 @@ class Stats:
         pts = list(self.per_sec)
         if self._cur_sec is not None:
             pts.append((self._cur_sec, *self._cur))
-        now = int(time.time())
+        # Anchor the window on the PROXY's own clock (the latest timestamp
+        # Squid itself wrote), not this host's time.time() — per_sec's keys
+        # are already bucketed by rec["ts"], so this keeps the window
+        # consistent with its own data instead of a wall clock that may not
+        # agree with it. Falls back to time.time() before any record arrives.
+        now = int(self.last_rec_ts) if self.last_rec_ts else int(time.time())
         by_sec = {p[0]: p for p in pts}
         out = []
         for s in range(now - RATE_WINDOW + 1, now + 1):
